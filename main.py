@@ -17,6 +17,10 @@ CONFIG = dict(
     batch_size     = 16,
     lr             = 1e-4,
     num_workers    = 4,
+    use_data_adapt = False,
+    da_strength    = "medium",
+    use_dann       = False,
+    dann_weight    = 0.2,
 )
 
 def banner(title: str, width: int = 60):
@@ -50,6 +54,24 @@ def step_verify(cfg) -> tuple:
 def step_train(cfg):
     """Run the two-phase training loop and save the best checkpoint."""
     banner("STEP 2 / 3  —  TRAINING")
+
+    # Print active adaptation summary before training starts
+    adapt_active = []
+    if getattr(cfg, "use_data_adapt", False):
+        adapt_active.append(
+            f"Data-level adaptation (strength={getattr(cfg, 'da_strength', 'medium')})"
+        )
+    if getattr(cfg, "use_dann", False):
+        adapt_active.append(
+            f"Feature-level DANN (dann_weight={getattr(cfg, 'dann_weight', 0.2)})"
+        )
+    if adapt_active:
+        print("Active domain adaptation modules:")
+        for m in adapt_active:
+            print(f"    • {m}")
+    else:
+        print("Domain adaptation: none (baseline mode)")
+    print()
 
     t0 = time.time()
     train(cfg)
@@ -113,8 +135,19 @@ def parse_args():
                    help="Head learning rate; backbone uses lr × 0.1 during fine-tune phase")
     p.add_argument("--num_workers",   type=int,   default=CONFIG["num_workers"],
                    help="DataLoader workers — use 0 on Windows or for debugging")
-    p.add_argument("--eval_only",     action="store_true",
-                   help="Skip training and run evaluation on an existing checkpoint")
+    # Data-level adaptation
+    p.add_argument("--use_data_adapt", action="store_true",
+                    default=CONFIG["use_data_adapt"],
+                    help=" Apply night-simulation augmentations to training images")
+    p.add_argument("--da_strength",   default=CONFIG["da_strength"],
+                    choices=["light", "medium", "strong"],
+                    help=" Night-simulation intensity (used with --use_data_adapt)")
+    # Feature-level DANN
+    p.add_argument("--use_dann",      action="store_true",
+                    default=CONFIG["use_dann"],
+                    help=" Enable domain-adversarial training (DANN)")
+    p.add_argument("--dann_weight",   type=float, default=CONFIG["dann_weight"],
+                    help=" Scale on DANN domain loss (used with --use_dann)")
     return p.parse_args()
 
 # Entry point
@@ -123,15 +156,14 @@ def main():
     cfg = args
 
     banner("WILDLIFE SPECIES CLASSIFIER  —  DINOv2-BASE BASELINE", width=60)
-    print(f" data_root     : {cfg.data_root}")
-    print(f" output_dir    : {cfg.output_dir}")
-    if not cfg.eval_only:
-        print(f"  epochs        : {cfg.epochs}  (warmup: {cfg.warmup_epochs})")
-        print(f"  batch_size    : {cfg.batch_size}")
-        print(f"  learning rate : {cfg.lr}  (backbone: {cfg.lr * 0.1})")
-        print(f"  num_workers   : {cfg.num_workers}")
-    else:
-        print("  mode          : eval-only (skipping training)")
+    print(f"  data_root     : {cfg.data_root}")
+    print(f"  output_dir    : {cfg.output_dir}")
+    print(f"  epochs        : {cfg.epochs}  (warmup: {cfg.warmup_epochs})")
+    print(f"  batch_size    : {cfg.batch_size}")
+    print(f"  learning rate : {cfg.lr}  (backbone: {cfg.lr * 0.1})")
+    print(f"  num_workers   : {cfg.num_workers}")
+    print(f"  data_adapt    : {'ON  (strength=' + cfg.da_strength + ')' if cfg.use_data_adapt else 'OFF'}")
+    print(f"  DANN          : {'ON  (weight=' + str(cfg.dann_weight) + ')' if cfg.use_dann else 'OFF'}")
 
     t_start = time.time()
 
@@ -139,15 +171,7 @@ def main():
     step_verify(cfg)
 
     # Step 2 — train (unless --eval_only)
-    if not cfg.eval_only:
-        step_train(cfg)
-    else:
-        checkpoint = Path(cfg.output_dir) / "best_model.pt"
-        if not checkpoint.exists():
-            print(f"[ERROR] --eval_only requested but no checkpoint at {checkpoint}")
-            print("Run without --eval_only first to train the model.")
-            sys.exit(1)
-        print(f"  Skipping training. Using checkpoint: {checkpoint}")
+    step_train(cfg)
 
     # Step 3 — evaluate
     step_evaluate(cfg)

@@ -12,6 +12,8 @@ from tqdm import tqdm
 from transformers import Dinov2Model
 
 from dataset import build_datasets, get_dataloaders
+from data_adaptation import get_adapted_train_transforms
+from dann import DomainAdversarialModel, build_dann_datasets, get_dann_dataloaders, dann_train_one_epoch, compute_lambda
 
 # Model
 class Dinov2Classifier(nn.Module):
@@ -119,7 +121,8 @@ def evaluate(
 
         for imgs, labels in pbar:
             imgs, labels = imgs.to(device), labels.to(device)
-            logits = model(imgs)
+            output = model(imgs)
+            logits = output[0] if isinstance(output, tuple) else output
             loss   = criterion(logits, labels)
             total_loss += loss.item() * imgs.size(0)
 
@@ -169,17 +172,72 @@ def train(args):
     )
     print(f"Device: {device}")
 
+    # Adaptation flags
+    use_data_adapt = getattr(args, "use_data_adapt", False)
+    use_dann       = getattr(args, "use_dann",       False)
+    da_strength    = getattr(args, "da_strength",    "medium")
+    dann_weight    = getattr(args, "dann_weight",    0.2)
+
     # Datasets & loaders
-    train_ds, test_ds, label2idx, idx2label = build_datasets(args.data_root)
-    train_loader, test_loader = get_dataloaders(
-        train_ds, test_ds,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
+    if use_dann:
+        # DANN path: build three datasets (source train, test, unlabelled target)
+        tqdm.write("  [DANN] Building domain-aware datasets …")
+        train_ds, test_ds, target_ds, label2idx, idx2label = build_dann_datasets(
+            args.data_root,
+            da_strength=da_strength if use_data_adapt else "light",
+        )
+        train_loader, test_loader, target_loader = get_dann_dataloaders(
+            train_ds, test_ds, target_ds,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+    else:
+        # Swap in adapted transforms when --use_data_adapt is set.
+        if use_data_adapt:
+            tqdm.write(f"  [DataAdapt] Using night-simulation transforms "
+                        f"(strength={da_strength}) …")
+            from dataset import scan_voc_split, WildlifeDataset
+            from pathlib import Path as _Path
+            root          = _Path(args.data_root)
+            train_records = scan_voc_split(root / "voc_day")
+            test_records  = scan_voc_split(root / "voc_night")
+            all_labels    = sorted({lbl for _, lbl, _ in train_records})
+            label2idx     = {lbl: i for i, lbl in enumerate(all_labels)}
+            idx2label     = {i: lbl for lbl, i in label2idx.items()}
+            filtered_test = [r for r in test_records if r[1] in label2idx]
+            train_ds      = WildlifeDataset(
+                train_records, label2idx,
+                get_adapted_train_transforms(da_strength),
+            )
+            test_ds = WildlifeDataset(
+                filtered_test, label2idx,
+                __import__("data_adaptation").get_night_test_transforms(),
+            )
+            print(f"\nClasses ({len(all_labels)}): {all_labels}\n")
+        else:
+            # Baseline dataset build
+            train_ds, test_ds, label2idx, idx2label = build_datasets(args.data_root)
+
+        train_loader, test_loader = get_dataloaders(
+            train_ds, test_ds,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        target_loader = None
+
     num_classes = len(label2idx)
 
     # Model — start with backbone frozen (Phase 1)
-    model = Dinov2Classifier(num_classes=num_classes, dropout=0.3).to(device)
+    if use_dann:
+        # DANN model
+        tqdm.write("  [DANN] Building DomainAdversarialModel …")
+        model = DomainAdversarialModel(
+            num_classes=num_classes, dropout=0.3, lambda_=0.0
+        ).to(device)
+    else:
+        # Baseline model
+        model = Dinov2Classifier(num_classes=num_classes, dropout=0.3).to(device)
+
     model.freeze_backbone()
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -192,6 +250,11 @@ def train(args):
     )
     # Cosine annealing smoothly reduces LR to near-zero over the full run.
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # Pre-compute total steps for lambda annealing
+    steps_per_epoch = len(train_loader)
+    total_steps     = steps_per_epoch * args.epochs
+    global_step     = 0   # incremented inside dann_train_one_epoch
 
     # Output directory
     out_dir = Path(args.output_dir)
@@ -207,8 +270,12 @@ def train(args):
     log_path = out_dir / "train_log.csv"
     log_file = open(log_path, "w", newline="")
     logger   = csv.writer(log_file)
-    logger.writerow(["epoch", "phase", "train_loss", "test_loss",
-                     "test_acc", "test_macro_f1"])
+    logger.writerow([
+        "epoch", "phase",
+        "train_loss",
+        "dann_cls_loss", "dann_domain_loss",
+        "test_loss", "test_acc", "test_macro_f1",
+    ])
 
     best_f1    = -1.0
     best_epoch = -1
@@ -220,6 +287,13 @@ def train(args):
           f"{len(train_ds)} train / {len(test_ds)} test")
     print(f"  Epochs: {args.epochs}  |  Warmup: {args.warmup_epochs}  |  "
           f"LR: {args.lr}  |  Batch: {args.batch_size}")
+    # Print active adaptation modules
+    adapt_flags = []
+    if use_data_adapt:
+        adapt_flags.append(f"DataAdapt({da_strength})")
+    if use_dann:
+        adapt_flags.append(f"DANN(w={dann_weight})")
+    print(f"  Adaptation:  {', '.join(adapt_flags) if adapt_flags else 'none (baseline)'}")
     print(f"{'='*60}\n")
 
     # Tracks overall progress across all epochs.
@@ -250,9 +324,36 @@ def train(args):
         phase = "warmup" if epoch <= args.warmup_epochs else "finetune"
         t0    = time.time()
 
-        # Train & evaluate
-        train_loss   = train_one_epoch(model, train_loader, optimizer, criterion,
-                                       device, epoch, args.epochs, phase)
+        # Train
+        dann_cls_loss    = ""
+        dann_domain_loss = ""
+
+        if use_dann:
+            # DANN training step
+            dann_cls, dann_dom, train_loss, global_step = dann_train_one_epoch(
+                model         = model,
+                source_loader = train_loader,
+                target_loader = target_loader,
+                optimizer     = optimizer,
+                cls_criterion = criterion,
+                device        = device,
+                epoch         = epoch,
+                total_epochs  = args.epochs,
+                phase         = phase,
+                global_step   = global_step,
+                total_steps   = total_steps,
+                dann_weight   = dann_weight,
+            )
+            dann_cls_loss    = f"{dann_cls:.6f}"
+            dann_domain_loss = f"{dann_dom:.6f}"
+        else:
+            # Standard single-domain training step
+            train_loss = train_one_epoch(
+                model, train_loader, optimizer, criterion,
+                device, epoch, args.epochs, phase,
+            )
+
+        # Evaluate
         test_metrics = evaluate(model, test_loader, criterion, device,
                                 num_classes, epoch, args.epochs)
         scheduler.step()
@@ -260,17 +361,23 @@ def train(args):
         elapsed = time.time() - t0
 
         # Update outer bar postfix
-        epoch_bar.set_postfix(
+        postfix = dict(
             phase=phase,
             tr_loss=f"{train_loss:.4f}",
             te_loss=f"{test_metrics['loss']:.4f}",
             acc=f"{test_metrics['accuracy']:.3f}",
             F1=f"{test_metrics['macro_f1']:.3f}",
         )
+        epoch_bar.set_postfix(**postfix)
 
+        dann_str = ""
+        if use_dann and dann_cls_loss:
+            lam = compute_lambda(global_step, total_steps)
+            dann_str = (f"  cls={dann_cls_loss}  dom={dann_domain_loss}"
+                        f"  λ={lam:.3f}")
         tqdm.write(
             f"  Epoch {epoch:>3}/{args.epochs} [{phase:>8}]  "
-            f"train_loss={train_loss:.4f}  "
+            f"train_loss={train_loss:.4f}{dann_str}  "
             f"test_loss={test_metrics['loss']:.4f}  "
             f"acc={test_metrics['accuracy']:.4f}  "
             f"macro_F1={test_metrics['macro_f1']:.4f}  "
@@ -281,6 +388,8 @@ def train(args):
         logger.writerow([
             epoch, phase,
             f"{train_loss:.6f}",
+            dann_cls_loss,
+            dann_domain_loss,
             f"{test_metrics['loss']:.6f}",
             f"{test_metrics['accuracy']:.6f}",
             f"{test_metrics['macro_f1']:.6f}",
@@ -299,6 +408,8 @@ def train(args):
                     "idx2label":   idx2label,
                     "num_classes": num_classes,
                     "args":        vars(args),
+                    "use_dann":     use_dann,
+                    "use_data_adapt": use_data_adapt,
                 },
                 best_path,
             )
@@ -322,6 +433,17 @@ def parse_args():
     p.add_argument("--batch_size",    type=int,   default=16,   help="Batch size")
     p.add_argument("--lr",            type=float, default=1e-4, help="Head learning rate")
     p.add_argument("--num_workers",   type=int,   default=4,    help="DataLoader worker processes")
+    # Data-level adaptation arguments
+    p.add_argument("--use_data_adapt", action="store_true",
+                    help="Apply night-simulation augmentations to training images")
+    p.add_argument("--da_strength",   default="medium",
+                    choices=["light", "medium", "strong"],
+                    help="Intensity of night-simulation augmentation")
+    # Feature-level DANN arguments
+    p.add_argument("--use_dann",      action="store_true",
+                    help="Enable domain-adversarial training (DANN)")
+    p.add_argument("--dann_weight",   type=float, default=0.2,
+                    help="Scale factor on the DANN domain loss")
     return p.parse_args()
 
 if __name__ == "__main__":
