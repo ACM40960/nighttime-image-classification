@@ -1,15 +1,15 @@
 import argparse
+import csv
 import json
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 
 from dataset import build_datasets, get_dataloaders
 from train import Dinov2Classifier
@@ -83,23 +83,57 @@ def compute_roc_auc(y_true_binary, y_score):
         tp_arr.append(tp)
         fp_arr.append(fp)
 
-    tpr = np.array(tp_arr) / n_pos
-    fpr = np.array(fp_arr) / n_neg
+    tpr = np.concatenate([[0.0], np.array(tp_arr) / n_pos])
+    fpr = np.concatenate([[0.0], np.array(fp_arr) / n_neg])
+    return float(np.trapezoid(tpr, fpr))
 
-    tpr = np.concatenate([[0.0], tpr])
-    fpr = np.concatenate([[0.0], fpr])
+def compute_pr_curve(y_true_binary, y_score):
+    """
+    Compute precision-recall curve for one binary problem.
+    """
+    order   = np.argsort(-y_score)
+    y_true_ = y_true_binary[order]
 
-    auc = float(np.trapezoid(tpr, fpr))
-    return auc
+    n_pos = y_true_.sum()
+    if n_pos == 0:
+        return np.array([0.0, 0.0]), np.array([0.0, 1.0])
 
+    tp_arr, fp_arr = [], []
+    tp = fp = 0
+    for label in y_true_:
+        if label == 1:
+            tp += 1
+        else:
+            fp += 1
+        tp_arr.append(tp)
+        fp_arr.append(fp)
+
+    tp_arr = np.array(tp_arr)
+    fp_arr = np.array(fp_arr)
+
+    precision = tp_arr / (tp_arr + fp_arr)
+    recall    = tp_arr / n_pos
+
+    # Prepend point at recall=0, precision=1 (standard convention)
+    precision = np.concatenate([[1.0], precision])
+    recall    = np.concatenate([[0.0], recall])
+    return precision, recall
+
+
+def compute_pr_auc(precision, recall):
+    """Area under the PR curve via trapezoidal rule."""
+    return float(np.trapezoid(precision, recall))
 
 def build_confusion_matrix(y_true, y_pred, num_classes):
-    """Return a (num_classes, num_classes) confusion matrix.
-    Row = true class, column = predicted class."""
-    cm = np.zeros((num_classes, num_classes), dtype=int)
+    """Return a (num_classes, num_classes) row-normalised fraction matrix."""
+    cm_counts = np.zeros((num_classes, num_classes), dtype=int)
     for t, p in zip(y_true, y_pred):
-        cm[t][p] += 1
-    return cm
+        cm_counts[t][p] += 1
+
+    # Row-normalise: each cell = fraction of true-class samples predicted as that class
+    row_sums = cm_counts.sum(axis=1, keepdims=True)
+    cm_frac  = np.where(row_sums > 0, cm_counts / row_sums, 0.0)
+    return cm_counts, cm_frac
 
 # Metrics computation
 def compute_all_metrics(y_true, y_pred, y_probs, num_classes, idx2label):
@@ -112,10 +146,17 @@ def compute_all_metrics(y_true, y_pred, y_probs, num_classes, idx2label):
     # Accuracy for class c in one-vs-rest sense
     acc_per_cls = safe_divide(tp + tn,  tp + tn + fp + fn)
 
-    auc_per_cls = np.array([
-        compute_roc_auc((y_true == c).astype(int), y_probs[:, c])
-        for c in range(num_classes)
-    ])
+    auc_roc_per_cls = np.array([
+            compute_roc_auc((y_true == c).astype(int), y_probs[:, c])
+            for c in range(num_classes)
+        ])
+    
+    pr_curves = []
+    pr_auc_per_cls = np.zeros(num_classes)
+    for c in range(num_classes):
+        prec, rec = compute_pr_curve((y_true == c).astype(int), y_probs[:, c])
+        pr_auc_per_cls[c] = compute_pr_auc(prec, rec)
+        pr_curves.append((prec, rec))
 
     per_class = []
     for c in range(num_classes):
@@ -131,36 +172,34 @@ def compute_all_metrics(y_true, y_pred, y_probs, num_classes, idx2label):
             "precision":   float(precision[c]),
             "accuracy":    float(acc_per_cls[c]),
             "f1":          float(f1[c]),
-            "auc_roc":     float(auc_per_cls[c]),
+            "auc_roc":     float(auc_roc_per_cls[c]),
+            "pr_auc":      float(pr_auc_per_cls[c]),
         })
 
-    # Macro averages (mean over classes that have test samples)
     has_samples = np.array([(y_true == c).sum() > 0 for c in range(num_classes)])
 
     def macro(arr):
         vals = arr[has_samples & ~np.isnan(arr)]
         return float(vals.mean()) if len(vals) > 0 else float("nan")
 
-    # Overall accuracy is a single number
-    overall_acc = float((y_true == y_pred).sum() / len(y_true))
-
     overall = {
-        "accuracy": overall_acc,
+        "accuracy":    float((y_true == y_pred).sum() / len(y_true)),
         "sensitivity": macro(sensitivity),
         "specificity": macro(specificity),
-        "precision": macro(precision),
-        "f1": macro(f1),
-        "auc_roc": macro(auc_per_cls),
+        "precision":   macro(precision),
+        "f1":          macro(f1),
+        "auc_roc":     macro(auc_roc_per_cls),
+        "pr_auc":      macro(pr_auc_per_cls),
     }
 
-    return {"per_class": per_class, "overall": overall}
+    return {"per_class": per_class, "overall": overall, "pr_curves": pr_curves}
 
 # Reporting
-def save_confusion_matrix(cm, class_names, out_path):
+def save_confusion_matrix(cm_counts, cm_frac, class_names, out_path):
     n = len(class_names)
     fig, ax = plt.subplots(figsize=(max(8, n), max(6, n - 2)))
 
-    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    im = ax.imshow(cm_frac, interpolation="nearest", cmap="Blues")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     ax.set_xticks(range(n))
@@ -171,72 +210,103 @@ def save_confusion_matrix(cm, class_names, out_path):
     ax.set_ylabel("True",      fontsize=11)
     ax.set_title("Confusion Matrix — voc_night (test)", fontsize=13)
 
-    thresh = cm.max() / 2.0
+    thresh = 0.5
     for i in range(n):
         for j in range(n):
-            ax.text(j, i, str(cm[i, j]),
+            ax.text(j, i, f"{cm_frac[i, j]:.3f}",
                     ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black",
-                    fontsize=8)
+                    color="white" if cm_frac[i, j] > thresh else "black",
+                    fontsize=7)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Confusion matrix figure → {out_path}")
+    print(f"Confusion matrix figure : {out_path}")
 
+def save_pr_auc_plot(metrics, class_names, out_path):
+    """
+    Save a PR curve plot — one curve per species plus the macro average.
+    """
+    pr_curves  = metrics["pr_curves"]
+    per_class  = metrics["per_class"]
+    macro_pr_auc = metrics["overall"]["pr_auc"]
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    cmap = plt.get_cmap("tab20")
+    for c, (prec, rec) in enumerate(pr_curves):
+        label = f"{class_names[c]} (AUC={per_class[c]['pr_auc']:.3f})"
+        ax.plot(rec, prec, color=cmap(c / len(pr_curves)),
+                linewidth=1.2, alpha=0.8, label=label)
+
+    ax.set_xlabel("Recall",    fontsize=12)
+    ax.set_ylabel("Precision", fontsize=12)
+    ax.set_title(f"Precision-Recall Curves — voc_night\n"
+                 f"Macro PR-AUC = {macro_pr_auc:.4f}", fontsize=13)
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.legend(loc="lower left", fontsize=7, ncol=2)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"PR-AUC plot : {out_path}")
 
 def save_text_report(metrics, out_path):
     ov = metrics["overall"]
     lines = [
-        "=" * 65,
+        "=" * 72,
         "  DINOv2-base  |  Wildlife Camera Trap  |  Night-Time Test",
-        "=" * 65,
+        "=" * 72,
         "",
         "OVERALL (macro-averaged)",
-        "-" * 40,
+        "-" * 45,
         f"  Accuracy     : {ov['accuracy']:.4f}",
-        f"  Sensitivity  : {ov['sensitivity']:.4f}  (macro recall)",
+        f"  Sensitivity  : {ov['sensitivity']:.4f}",
         f"  Specificity  : {ov['specificity']:.4f}",
-        f"  Precision    : {ov['precision']:.4f}  (macro)",
-        f"  F1-score     : {ov['f1']:.4f}  (macro)",
+        f"  Precision    : {ov['precision']:.4f}",
+        f"  F1-score     : {ov['f1']:.4f}",
         f"  AUC-ROC      : {ov['auc_roc']:.4f}  (macro, one-vs-rest)",
+        f"  PR-AUC       : {ov['pr_auc']:.4f}  (macro, one-vs-rest)",
         "",
         "PER-SPECIES",
-        "-" * 40,
+        "-" * 45,
     ]
 
     header = (f"{'Class':<22} {'N':>5} {'Sens':>6} {'Spec':>6} "
-              f"{'Prec':>6} {'Acc':>6} {'F1':>6} {'AUC':>6}")
+              f"{'Prec':>6} {'Acc':>6} {'F1':>6} {'ROC':>6} {'PR':>6}")
     lines.append(header)
     lines.append("-" * len(header))
 
     for pc in metrics["per_class"]:
-        auc_str = f"{pc['auc_roc']:.4f}" if not np.isnan(pc["auc_roc"]) else "  N/A "
+        roc_str = f"{pc['auc_roc']:.4f}" if not np.isnan(pc["auc_roc"]) else "  N/A "
+        pr_str  = f"{pc['pr_auc']:.4f}"
         lines.append(
             f"{pc['class']:<22} {pc['n_samples']:>5} "
             f"{pc['sensitivity']:>6.4f} {pc['specificity']:>6.4f} "
             f"{pc['precision']:>6.4f} {pc['accuracy']:>6.4f} "
-            f"{pc['f1']:>6.4f} {auc_str:>6}"
+            f"{pc['f1']:>6.4f} {roc_str:>6} {pr_str:>6}"
         )
 
-    lines += ["", "=" * 65]
+    lines += ["", "=" * 72]
     report = "\n".join(lines)
     print("\n" + report)
     out_path.write_text(report)
-    print(f"\nReport saved → {out_path}")
+    print(f"\nReport saved : {out_path}")
 
 
 def save_per_class_csv(metrics, out_path):
-    import csv
     fields = ["class", "n_samples", "TP", "TN", "FP", "FN",
-              "sensitivity", "specificity", "precision", "accuracy", "f1", "auc_roc"]
+              "sensitivity", "specificity", "precision", "accuracy",
+              "f1", "auc_roc", "pr_auc"]
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for pc in metrics["per_class"]:
             w.writerow({k: (f"{pc[k]:.6f}" if isinstance(pc[k], float) else pc[k])
                         for k in fields})
-    print(f"Per-class CSV  → {out_path}")
+    print(f"Per-class CSV  : {out_path}")
 
 # Main
 def evaluate(args):
@@ -249,69 +319,70 @@ def evaluate(args):
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}\n"
-            "Run train.py first to generate outputs/best_model.pt"
-        )
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     # Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt       = torch.load(checkpoint_path, map_location=device)
     label2idx  = ckpt["label2idx"]
     idx2label  = {int(k): v for k, v in ckpt["idx2label"].items()}
     num_classes = ckpt["num_classes"]
+    run_ts      = getattr(args, "run_ts", "run")
 
     print(f"Checkpoint: epoch {ckpt['epoch']}  |  {num_classes} classes")
 
-    model = Dinov2Classifier(num_classes=num_classes).to(device)
+    # Reconstruct correct model class from checkpoint metadata
+    use_dann = ckpt.get("use_dann", False)
+    if use_dann:
+        from dann import DomainAdversarialModel
+        model = DomainAdversarialModel(num_classes=num_classes).to(device)
+    else:
+        model = Dinov2Classifier(num_classes=num_classes).to(device)
+
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    # Dataset
-    _, test_ds, _, _ = build_datasets(args.data_root)
-    _, test_loader   = get_dataloaders(
-        test_ds, test_ds,
+    # Use the test split (80% of voc_night)
+    _, _, test_ds, _, _, _ = build_datasets(args.data_root)
+    _, _, test_loader, _ = get_dataloaders(
+        test_ds, test_ds, test_ds, test_ds,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
 
-    # Inference
-    print("\nRunning inference on voc_night …")
-    y_true, y_pred, y_probs = get_predictions(
-        model, test_loader, device, num_classes
-    )
+    print("\nRunning inference on voc_night test split …")
+    y_true, y_pred, y_probs = get_predictions(model, test_loader, device)
     print(f"Samples evaluated: {len(y_true)}")
 
-    # Metrics
     metrics = compute_all_metrics(y_true, y_pred, y_probs, num_classes, idx2label)
 
-    # Save outputs
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     class_names = [idx2label[c] for c in range(num_classes)]
+    ts = run_ts
 
-    save_text_report(metrics, out_dir / "evaluation_report.txt")
-    save_per_class_csv(metrics, out_dir / "metrics_per_class.csv")
+    save_text_report(metrics,   out_dir / f"evaluation_report_{ts}.txt")
+    save_per_class_csv(metrics, out_dir / f"metrics_per_class_{ts}.csv")
+    save_pr_auc_plot(metrics, class_names, out_dir / f"pr_auc_{ts}.png")
 
-    cm = build_confusion_matrix(y_true, y_pred, num_classes)
-    save_confusion_matrix(cm, class_names, out_dir / "confusion_matrix.png")
+    cm_counts, cm_frac = build_confusion_matrix(y_true, y_pred, num_classes)
+    save_confusion_matrix(cm_counts, cm_frac, class_names,
+                            out_dir / f"confusion_matrix_{ts}.png")
 
-    # Raw confusion matrix CSV
-    import csv
-    with open(out_dir / "confusion_matrix.csv", "w", newline="") as f:
+    with open(out_dir / f"confusion_matrix_{ts}.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["true \\ pred"] + class_names)
-        for i, row in enumerate(cm):
-            w.writerow([class_names[i]] + row.tolist())
-    print(f"Confusion CSV  → {out_dir / 'confusion_matrix.csv'}")
+        for i, row in enumerate(cm_frac):
+            w.writerow([class_names[i]] + [f"{v:.6f}" for v in row])
+    print(f"Confusion CSV  : {out_dir / f'confusion_matrix_{ts}.csv'}")
 
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained DINOv2 on voc_night.")
-    p.add_argument("--checkpoint",   default="outputs/best_model.pt")
-    p.add_argument("--data_root",    default="data")
-    p.add_argument("--output_dir",   default="outputs")
-    p.add_argument("--batch_size",   type=int, default=32)
-    p.add_argument("--num_workers",  type=int, default=4)
+    p.add_argument("--checkpoint",  default="outputs/best_model.pt")
+    p.add_argument("--data_root",   default="./data")
+    p.add_argument("--output_dir",  default="./outputs")
+    p.add_argument("--run_ts",      default="run")
+    p.add_argument("--batch_size",  type=int, default=32)
+    p.add_argument("--num_workers", type=int, default=4)
     return p.parse_args()
 
 

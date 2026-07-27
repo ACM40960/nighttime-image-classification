@@ -1,5 +1,6 @@
-import os
+import random
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -19,6 +20,7 @@ IMAGE_SIZE = 224
 
 # Fractional padding added around each bounding box before cropping.
 BBOX_PAD_FRAC = 0.05
+SPLIT_SEED = 42
 BBox = Optional[Tuple[int, int, int, int]]
 
 
@@ -35,6 +37,13 @@ def get_train_transforms() -> transforms.Compose:
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
+def get_eval_transforms() -> transforms.Compose:
+    """Deterministic pipeline for validation and test splits."""
+    return transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
 
 def get_test_transforms() -> transforms.Compose:
     """Minimal, deterministic pipeline for the nighttime test split."""
@@ -131,6 +140,35 @@ def scan_voc_split(split_dir: Path) -> List[Tuple[Path, str]]:
           f"({skipped} skipped, {no_bbox} without bounding boxes).")
     return records
 
+def stratified_split(
+    records: List[Tuple[Path, str, BBox]],
+    val_fraction: float,
+    seed: int = SPLIT_SEED,
+) -> Tuple[List, List]:
+    """
+    Split records into (main, val) lists with class-balanced sampling.
+    """
+    rng = random.Random(seed)
+
+    # Group indices by class label
+    class_indices: Dict[str, List[int]] = defaultdict(list)
+    for i, (_, label, _) in enumerate(records):
+        class_indices[label].append(i)
+
+    main_idx = []
+    val_idx  = []
+
+    for label, indices in sorted(class_indices.items()):
+        shuffled = indices[:]
+        rng.shuffle(shuffled)
+        n_val = max(1, int(len(shuffled) * val_fraction))
+        val_idx.extend(shuffled[:n_val])
+        main_idx.extend(shuffled[n_val:])
+
+    main_records = [records[i] for i in sorted(main_idx)]
+    val_records  = [records[i] for i in sorted(val_idx)]
+    return main_records, val_records
+
 # PyTorch Dataset
 class WildlifeDataset(Dataset):
     """
@@ -186,76 +224,89 @@ class WildlifeDataset(Dataset):
 # Build datasets and dataloaders
 def build_datasets(
     data_root: str = "data",
-) -> Tuple["WildlifeDataset", "WildlifeDataset", Dict[str, int], Dict[int, str]]:
+) -> Tuple["WildlifeDataset", "WildlifeDataset",
+           "WildlifeDataset", "WildlifeDataset",
+           Dict[str, int], Dict[int, str]]:
     """
-    Scan voc_day (train) and voc_night (test) and return dataset objects.
+    Scan voc_day and voc_night, apply class-balanced splitting, and return dataset objects.
     """
     root = Path(data_root)
-    train_records = scan_voc_split(root / "voc_day")
-    test_records  = scan_voc_split(root / "voc_night")
+    day_records   = scan_voc_split(root / "voc_day")
+    night_records = scan_voc_split(root / "voc_night")
 
-    # Build label vocabulary from the training split.
-    all_labels = sorted({label for _, label, _ in train_records})
+    # Build vocabulary from voc_day only
+    all_labels = sorted({label for _, label, _ in day_records})
     label2idx  = {lbl: i for i, lbl in enumerate(all_labels)}
     idx2label  = {i: lbl for lbl, i in label2idx.items()}
 
     print(f"\nClasses ({len(all_labels)}): {all_labels}\n")
 
-    # Filter test records to known labels
-    filtered_test = []
-    for rec in test_records:
-        if rec[1] in label2idx:
-            filtered_test.append(rec)
-        else:
-            print(f"[WARN] Test label '{rec[1]}' not seen in training — skipped.")
+    # Class-balanced stratified split — voc_day: 90% train / 10% val
+    train_records, val_day_records = stratified_split(
+        day_records, val_fraction=0.10, seed=SPLIT_SEED
+    )
 
-    train_dataset = WildlifeDataset(train_records, label2idx, get_train_transforms())
-    test_dataset  = WildlifeDataset(filtered_test,  label2idx, get_test_transforms())
+    # Class-balanced stratified split — voc_night: 80% test / 20% val
+    night_records_known = [r for r in night_records if r[1] in label2idx]
+    test_records, val_night_records = stratified_split(
+        night_records_known, val_fraction=0.20, seed=SPLIT_SEED
+    )
 
-    return train_dataset, test_dataset, label2idx, idx2label
+    print(f"  voc_day   : {len(train_records)} train  / {len(val_day_records)} val")
+    print(f"  voc_night : {len(test_records)} test   / {len(val_night_records)} val\n")
+
+    train_ds     = WildlifeDataset(train_records,     label2idx, get_train_transforms())
+    val_day_ds   = WildlifeDataset(val_day_records,   label2idx, get_eval_transforms())
+    test_ds      = WildlifeDataset(test_records,      label2idx, get_eval_transforms())
+    val_night_ds = WildlifeDataset(val_night_records, label2idx, get_eval_transforms())
+
+    return train_ds, val_day_ds, test_ds, val_night_ds, label2idx, idx2label
 
 
 def get_dataloaders(
-    train_dataset: "WildlifeDataset",
-    test_dataset:  "WildlifeDataset",
-    batch_size: int = 16,
-    num_workers: int = 4,
-) -> Tuple[DataLoader, DataLoader]:
+    train_ds:     "WildlifeDataset",
+    val_day_ds:   "WildlifeDataset",
+    test_ds:      "WildlifeDataset",
+    val_night_ds: "WildlifeDataset",
+    batch_size:   int = 16,
+    num_workers:  int = 4,
+) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
+    """Return train, val_day, test, and val_night DataLoaders."""
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
+    )
+    val_day_loader = DataLoader(
+        val_day_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
     )
     test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+        test_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
     )
-    return train_loader, test_loader
+    val_night_loader = DataLoader(
+        val_night_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+    return train_loader, val_day_loader, test_loader, val_night_loader
 
 # Quick self-test
 if __name__ == "__main__":
     import sys
 
     data_root = sys.argv[1] if len(sys.argv) > 1 else "data"
-    train_ds, test_ds, label2idx, idx2label = build_datasets(data_root)
+    train_ds, val_day_ds, test_ds, val_night_ds, label2idx, idx2label = build_datasets(data_root)
 
     print(f"Train samples : {len(train_ds)}")
+    print(f"Val (day) samples : {len(val_day_ds)}")
     print(f"Test samples  : {len(test_ds)}")
+    print(f"Val (night) samples : {len(val_night_ds)}")
     print(f"Num classes   : {len(label2idx)}")
 
-    # Show bbox coverage
-    train_with_bbox = sum(1 for _, _, b in train_ds.records if b is not None)
-    test_with_bbox  = sum(1 for _, _, b in test_ds.records  if b is not None)
-    print(f"Train bbox coverage : {train_with_bbox}/{len(train_ds)}")
-    print(f"Test bbox coverage  : {test_with_bbox}/{len(test_ds)}")
-
     # One batch check
-    train_loader, _ = get_dataloaders(train_ds, test_ds, batch_size=4, num_workers=0)
+    train_loader, val_day_loader, test_loader, val_night_loader = get_dataloaders(
+        train_ds, val_day_ds, test_ds, val_night_ds, batch_size=4, num_workers=0
+    )
     imgs, labels = next(iter(train_loader))
     print(f"Batch shape   : {imgs.shape}")
     print(f"Label indices : {labels.tolist()}")
