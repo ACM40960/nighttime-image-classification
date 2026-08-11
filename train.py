@@ -6,107 +6,263 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from transformers import Dinov2Model
 
 from dataset import build_datasets, get_dataloaders
-from data_adaptation import get_adapted_train_transforms, get_night_test_transforms
-from dann import DomainAdversarialModel, build_dann_datasets, get_dann_dataloaders, dann_train_one_epoch, compute_lambda
+
+
 
 # Model
 class Dinov2Classifier(nn.Module):
     """
-    DINOv2-base backbone with a lightweight linear classification head.
+    DINOv2-base backbone with a linear classification head and an optional
+    projection head for supervised contrastive learning.
+
+    Architecture
+    ------------
+    Backbone       : DINOv2-base (ViT-B/14, 12 transformer blocks, hidden dim 768).
+    Head           : Dropout(p) -> Linear(768, num_classes).
+    Projection head: Linear(768, 768) -> ReLU -> Linear(768, 128), L2-normalised.
+                     Present only when use_supcon is True.  Used during Phase 1
+                     SupCon training and discarded in Phase 2.
+
+    Backbone state per phase
+    ------------------------
+    Without SupCon:
+      Phase 1 : fully frozen.
+      Phase 2 : frozen except last finetune_blocks blocks and final layer norm.
+
+    With SupCon:
+      Phase 1a : fully frozen (projection head stabilisation).
+      Phase 1b : fully unfrozen at lr * 0.01 (contrastive backbone shaping).
+      Phase 2  : re-frozen, then last finetune_blocks blocks unfrozen at lr * 0.02.
     """
+
     BACKBONE_ID = "facebook/dinov2-base"
 
-    def __init__(self, num_classes: int, dropout: float = 0.3):
+    def __init__(self, num_classes: int, dropout: float = 0.3,
+                 use_supcon: bool = False):
         super().__init__()
+        self.use_supcon = use_supcon
 
-        # Load pretrained ViT-B/14 weights from HuggingFace Hub
         self.backbone = Dinov2Model.from_pretrained(self.BACKBONE_ID)
-        hidden_size   = self.backbone.config.hidden_size  # 768 for ViT-B
+        hidden_size   = self.backbone.config.hidden_size  # 768
 
         self.head = nn.Sequential(
             nn.Dropout(p=dropout),
             nn.Linear(hidden_size, num_classes),
         )
 
-    # Backbone freeze / unfreeze helpers
+        # Projection head used only during SupCon warmup phase.
+        if use_supcon:
+            self.proj_head = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_size, 128),
+            )
 
     def freeze_backbone(self):
-        """Disable gradient computation for all backbone parameters (Phase 1)."""
+        """Freeze all backbone parameters."""
         for param in self.backbone.parameters():
             param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Unfreeze all backbone parameters (used in SupCon Phase 1b)."""
+        for param in self.backbone.parameters():
+            param.requires_grad = True
 
     def unfreeze_last_blocks(self, n: int = 3):
         """
-        Unfreeze only the last `n` transformer encoder blocks and the layer norm that follows them.  All other backbone parameters remain frozen.
+        Unfreeze the last n transformer encoder blocks and the final layer norm.
+
+        All other backbone parameters remain frozen.  For DINOv2-base with 12
+        encoder blocks total, n=3 unfreezes blocks 9, 10, and 11.
         """
-        # Keep everything frozen first
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # Unfreeze the last n encoder blocks
         total_blocks = len(self.backbone.encoder.layer)
         for block in self.backbone.encoder.layer[total_blocks - n:]:
             for param in block.parameters():
                 param.requires_grad = True
 
-        # Unfreeze the final layernorm (sits after all encoder blocks)
         if hasattr(self.backbone, "layernorm"):
             for param in self.backbone.layernorm.parameters():
                 param.requires_grad = True
 
-    # Forward pass
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        return_projection: bool = False,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        pixel_values      : (B, 3, 224, 224) normalised image batch.
+        return_projection : if True, return the L2-normalised projection
+                            embedding instead of class logits.  Only valid
+                            when use_supcon is True.
+
+        Returns
+        -------
+        logits     : (B, num_classes) when return_projection is False.
+        projection : (B, 128) L2-normalised when return_projection is True.
+        """
         outputs   = self.backbone(pixel_values=pixel_values)
-        cls_token = outputs.last_hidden_state[:, 0, :]
+        cls_token = outputs.last_hidden_state[:, 0, :]  # (B, 768)
+
+        if return_projection and self.use_supcon:
+            proj = self.proj_head(cls_token)
+            return F.normalize(proj, dim=1)
+
         return self.head(cls_token)
 
-# Training pass — one epoch
+# Supervised Contrastive Loss
+class SupConLoss(nn.Module):
+    """
+    Supervised Contrastive Loss (Khosla et al., NeurIPS 2020).
+
+    For each anchor sample, all samples sharing the same class label are
+    treated as positives and all others as negatives.  The loss encourages
+    the model to produce embeddings where same-class samples cluster together
+    on the unit hypersphere.
+
+    Parameters
+    ----------
+    temperature : float
+        Temperature scaling factor applied to the dot-product similarities.
+        Lower values sharpen the distribution; 0.07 is the value used in the
+        original paper.
+    """
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(
+        self, features: torch.Tensor, labels: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        features : (B, D) L2-normalised embeddings.
+        labels   : (B,)   integer class labels.
+
+        Returns
+        -------
+        loss : scalar tensor.
+        """
+        device = features.device
+        B      = features.size(0)
+
+        # Pairwise cosine similarity matrix scaled by temperature.
+        sim = torch.matmul(features, features.T) / self.temperature  # (B, B)
+
+        # Mask: 1 where i and j share the same class, 0 otherwise.
+        label_eq = labels.unsqueeze(0) == labels.unsqueeze(1)  # (B, B)
+        # Exclude the diagonal (self-similarity).
+        eye      = torch.eye(B, dtype=torch.bool, device=device)
+        pos_mask = label_eq & ~eye
+
+        # Numerical stability: subtract row-wise maximum.
+        sim_max, _ = sim.max(dim=1, keepdim=True)
+        sim        = sim - sim_max.detach()
+
+        exp_sim = torch.exp(sim)
+
+        # Denominator: sum over all non-self pairs.
+        denom = (exp_sim * (~eye).float()).sum(dim=1)  # (B,)
+
+        # Numerator: sum of exp similarities over positives.
+        # For rows with no positives (single-sample classes in the batch),
+        # the loss contribution is zero.
+        n_pos = pos_mask.float().sum(dim=1)  # (B,)
+        log_prob = sim - torch.log(denom + 1e-8)
+
+        loss_per_anchor = -(pos_mask.float() * log_prob).sum(dim=1) / (n_pos + 1e-8)
+
+        # Average only over anchors that have at least one positive.
+        valid = n_pos > 0
+        if valid.sum() == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        return loss_per_anchor[valid].mean()
+
+
+# Training pass - one epoch
 def train_one_epoch(
     model, loader, optimizer, criterion, device,
-    epoch, total_epochs, phase,
+    epoch, total_epochs, sub_phase, use_supcon_active,
 ) -> float:
+    """
+    Run one full pass over the training DataLoader.
+
+    Parameters
+    ----------
+    sub_phase        : string label describing the current sub-phase, used in
+                       the tqdm progress bar (e.g. "1a", "1b", "2").
+    use_supcon_active: whether SupCon loss and the projection head are active
+                       for this epoch.  When False, the classification head and
+                       cross-entropy are used.
+
+    Returns
+    -------
+    mean_loss : float  average loss per sample for this epoch.
+    """
     model.train()
     total_loss = 0.0
     n_correct  = 0
     n_samples  = 0
 
-    desc = f"  Train E{epoch:>2}/{total_epochs} [{phase}]"
+    desc = f"  Train E{epoch:>2}/{total_epochs} [phase {sub_phase}]"
     with tqdm(loader, desc=desc, leave=False, unit="batch",
               bar_format="{l_bar}{bar:25}{r_bar}") as pbar:
         for imgs, labels in pbar:
             imgs, labels = imgs.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(imgs)
-            loss   = criterion(logits, labels)
+
+            if use_supcon_active:
+                embeddings = model(imgs, return_projection=True)
+                loss       = criterion(embeddings, labels)
+            else:
+                logits = model(imgs)
+                loss   = criterion(logits, labels)
+
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             batch_n     = imgs.size(0)
             total_loss += loss.item() * batch_n
-            n_correct  += (logits.argmax(1) == labels).sum().item()
             n_samples  += batch_n
 
-            pbar.set_postfix(
-                loss=f"{total_loss / n_samples:.4f}",
-                acc=f"{n_correct / n_samples:.3f}",
-            )
+            if not use_supcon_active:
+                n_correct += (logits.argmax(1) == labels).sum().item()
+                pbar.set_postfix(
+                    loss=f"{total_loss / n_samples:.4f}",
+                    acc=f"{n_correct / n_samples:.3f}",
+                )
+            else:
+                pbar.set_postfix(loss=f"{total_loss / n_samples:.4f}")
 
     return total_loss / len(loader.dataset)
 
-# Evaluation pass — one epoch
+# Evaluation pass - one epoch
 @torch.no_grad()
 def evaluate(
     model, loader, criterion, device,
     num_classes, epoch, total_epochs, split_name="Eval",
 ) -> dict:
+    """
+    Run inference on a DataLoader and return loss, accuracy, and macro-F1.
+
+    Always uses the classification head regardless of SupCon setting.
+    """
     model.eval()
     total_loss = 0.0
     all_preds  = []
@@ -118,21 +274,20 @@ def evaluate(
         for imgs, labels in pbar:
             imgs, labels = imgs.to(device), labels.to(device)
 
-            output = model(imgs)
-            logits = output[0] if isinstance(output, tuple) else output
-
-            loss = criterion(logits, labels)
+            # Always call the classification head for evaluation.
+            logits = model(imgs, return_projection=False)
+            loss   = criterion(logits, labels)
             total_loss += loss.item() * imgs.size(0)
 
             preds = logits.argmax(dim=1)
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
 
-            # Show running accuracy on the eval bar
-            running_acc = sum(t == p for t, p in zip(all_labels, all_preds)) / len(all_labels)
+            running_acc = sum(
+                t == p for t, p in zip(all_labels, all_preds)
+            ) / len(all_labels)
             pbar.set_postfix(acc=f"{running_acc:.3f}")
 
-    # Macro-F1 (one-vs-rest per class)
     tp = [0] * num_classes
     fp = [0] * num_classes
     fn = [0] * num_classes
@@ -150,7 +305,9 @@ def evaluate(
         f1_scores.append((2 * tp[c] / denom) if denom > 0 else 0.0)
 
     macro_f1 = sum(f1_scores) / num_classes
-    accuracy  = sum(t == p for t, p in zip(all_labels, all_preds)) / len(all_labels)
+    accuracy  = sum(
+        t == p for t, p in zip(all_labels, all_preds)
+    ) / len(all_labels)
 
     return {
         "loss":      total_loss / len(loader.dataset),
@@ -168,107 +325,59 @@ def train(args):
     print(f"Device: {device}")
 
     use_data_adapt  = getattr(args, "use_data_adapt",  False)
-    use_dann        = getattr(args, "use_dann",        False)
-    da_strength     = getattr(args, "da_strength",     "medium")
-    dann_weight     = getattr(args, "dann_weight",     1.0)
-    finetune_blocks = getattr(args, "finetune_blocks", 3)
-    run_ts          = getattr(args, "run_ts",          "run")
+    use_supcon      = getattr(args, "use_supcon",       False)
+    finetune_blocks = getattr(args, "finetune_blocks",  3)
+    run_ts          = getattr(args, "run_ts",           "run")
 
-    # Datasets & loaders
-    if use_dann:
-        tqdm.write("  [DANN] Building domain-aware datasets …")
-        train_ds, val_day_ds, test_ds, val_night_ds, label2idx, idx2label = \
-            build_dann_datasets(
-                args.data_root,
-                da_strength=da_strength if use_data_adapt else "light",
-            )
-        train_loader, val_day_loader, test_loader, val_night_loader = \
-            get_dann_dataloaders(
-                train_ds, val_day_ds, test_ds, val_night_ds,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-            )
-        # Build unlabelled target loader separately (all night images)
-        from dann import DomainDataset
-        from pathlib import Path as _Path
-        night_img_dir = _Path(args.data_root) / "voc_night" / "JPEGImages"
-        target_ds     = DomainDataset.from_dir(night_img_dir, get_night_test_transforms())
-        from torch.utils.data import DataLoader as _DL
-        target_loader = _DL(
-            target_ds, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, pin_memory=True, drop_last=True,
-        )
-    else:
-        # Swap in adapted transforms when --use_data_adapt is set.
-        if use_data_adapt:
-            tqdm.write(f"  [DataAdapt] strength={da_strength} …")
-            from dataset import scan_voc_split, WildlifeDataset, stratified_split, \
-                get_eval_transforms, SPLIT_SEED
-            from pathlib import Path as _Path
-            root          = _Path(args.data_root)
-            day_records   = scan_voc_split(root / "voc_day")
-            night_records = scan_voc_split(root / "voc_night")
-            all_labels    = sorted({lbl for _, lbl, _ in day_records})
-            label2idx     = {lbl: i for i, lbl in enumerate(all_labels)}
-            idx2label     = {i: lbl for lbl, i in label2idx.items()}
-            print(f"\nClasses ({len(all_labels)}): {all_labels}\n")
-
-            train_records, val_day_records = stratified_split(
-                day_records, val_fraction=0.10, seed=SPLIT_SEED
-            )
-            night_known = [r for r in night_records if r[1] in label2idx]
-            test_records, val_night_records = stratified_split(
-                night_known, val_fraction=0.20, seed=SPLIT_SEED
-            )
-            print(f"  voc_day   : {len(train_records)} train / {len(val_day_records)} val")
-            print(f"  voc_night : {len(test_records)} test  / {len(val_night_records)} val\n")
-
-            train_ds     = WildlifeDataset(train_records,     label2idx,
-                                           get_adapted_train_transforms(da_strength))
-            val_day_ds   = WildlifeDataset(val_day_records,   label2idx, get_eval_transforms())
-            test_ds      = WildlifeDataset(test_records,      label2idx, get_eval_transforms())
-            val_night_ds = WildlifeDataset(val_night_records, label2idx, get_night_test_transforms())
-        else:
-            train_ds, val_day_ds, test_ds, val_night_ds, label2idx, idx2label = \
-                build_datasets(args.data_root)
-
-        train_loader, val_day_loader, test_loader, val_night_loader = get_dataloaders(
-            train_ds, val_day_ds, test_ds, val_night_ds,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
-        target_loader = None
+    # Datasets and loaders
+    train_ds, test_ds, val_night_ds, label2idx, idx2label = build_datasets(
+        args.data_root, use_data_adapt=use_data_adapt
+    )
+    train_loader, test_loader, val_night_loader = get_dataloaders(
+        train_ds, test_ds, val_night_ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
 
     num_classes = len(label2idx)
 
-    # Model — start with backbone frozen (Phase 1)
-    if use_dann:
-        tqdm.write("  [DANN] Building DomainAdversarialModel …")
-        model = DomainAdversarialModel(
-            num_classes=num_classes, dropout=0.3, lambda_=0.0
-        ).to(device)
+    # SupCon epoch boundaries.
+    # Phase 1a: epochs 1 .. supcon_freeze_end  (backbone frozen, proj head, SupCon)
+    # Phase 1b: epochs supcon_freeze_end+1 .. warmup_epochs  (backbone unfrozen, SupCon)
+    # Phase 2 : epochs warmup_epochs+1 .. total_epochs  (last N blocks, CE)
+    #
+    # When SupCon is off, supcon_freeze_end is unused; all warmup_epochs are
+    # standard Phase 1 (backbone frozen, classification head, CE).
+    SUPCON_HEAD_STABILISE = 5
+    if use_supcon:
+        supcon_freeze_end = min(SUPCON_HEAD_STABILISE, args.warmup_epochs)
     else:
-        model = Dinov2Classifier(num_classes=num_classes, dropout=0.3).to(device)
+        supcon_freeze_end = args.warmup_epochs  # unused but defined for clarity
 
+    # Model
+    model = Dinov2Classifier(
+        num_classes=num_classes, dropout=0.3, use_supcon=use_supcon
+    ).to(device)
     model.freeze_backbone()
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Loss functions.
+    ce_criterion     = nn.CrossEntropyLoss(label_smoothing=0.1)
+    supcon_criterion = SupConLoss(temperature=0.07)
 
-    # Phase 1 optimiser: only head parameters have requires_grad=True.
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=1e-4,
-    )
+    # Initial optimiser for epoch 1.
+    # Without SupCon: backbone frozen, classification head only.
+    # With SupCon:    backbone frozen, projection head only.
+    #                 Classification head is excluded entirely until Phase 2.
+    if use_supcon:
+        initial_params = list(model.proj_head.parameters())
+    else:
+        initial_params = list(model.head.parameters())
+
+    optimizer = AdamW(initial_params, lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Pre-compute total steps for lambda annealing
-    steps_per_epoch = len(train_loader)
-    total_steps     = steps_per_epoch * args.epochs
-    global_step     = 0
-
-    # Output paths with datetime stamp
-    out_dir  = Path(args.output_dir)
+    # Output paths
+    out_dir   = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     best_path = out_dir / f"best_model_{run_ts}.pt"
     log_path  = out_dir / f"train_log_{run_ts}.csv"
@@ -282,32 +391,39 @@ def train(args):
     log_file = open(log_path, "w", newline="")
     logger   = csv.writer(log_file)
     logger.writerow([
-        "epoch", "phase",
-        "train_loss",
-        "dann_cls_loss", "dann_domain_loss",
-        "val_day_loss",   "val_day_acc",   "val_day_f1",
+        "epoch", "sub_phase", "train_loss",
         "val_night_loss", "val_night_acc", "val_night_f1",
     ])
 
     best_f1    = -1.0
     best_epoch = -1
 
-    # Header
+    # Training header
     print(f"\n{'='*60}")
-    print(f"  DINOv2-base  |  {num_classes} classes")
-    print(f"  Train: {len(train_ds)}  ValDay: {len(val_day_ds)}  "
-          f"Test: {len(test_ds)}  ValNight: {len(val_night_ds)}")
-    print(f"  Epochs: {args.epochs}  Warmup: {args.warmup_epochs}  "
-          f"FineTuneBlocks: {finetune_blocks}  LR: {args.lr}  Batch: {args.batch_size}")
-    adapt_flags = []
+    print(f"  Model    : DINOv2-base  ({num_classes} classes)")
+    print(f"  Train    : {len(train_ds)} samples, "
+          f"Val night : {len(val_night_ds)} samples, "
+          f"Test : {len(test_ds)} samples")
+    if use_supcon:
+        print(f"  Epochs   : {args.epochs} total  ("
+              f"phase 1a: {supcon_freeze_end}, "
+              f"phase 1b: {max(0, args.warmup_epochs - supcon_freeze_end)}, "
+              f"phase 2: {args.epochs - args.warmup_epochs})")
+    else:
+        print(f"  Epochs   : {args.epochs} total  ("
+              f"phase 1: {args.warmup_epochs}, "
+              f"phase 2: {args.epochs - args.warmup_epochs})")
+    print(f"  LR       : {args.lr}  "
+          f"(backbone phase 1b: {args.lr * 0.01}, phase 2: {args.lr * 0.02})")
+    print(f"  Batch    : {args.batch_size}")
+    adapt_parts = []
     if use_data_adapt:
-        adapt_flags.append(f"DataAdapt({da_strength})")
-    if use_dann:
-        adapt_flags.append(f"DANN(w={dann_weight})")
-    print(f"  Adaptation: {', '.join(adapt_flags) if adapt_flags else 'none (baseline)'}")
+        adapt_parts.append("data adaptation (medium)")
+    if use_supcon:
+        adapt_parts.append("supervised contrastive loss")
+    print(f"  Options  : {', '.join(adapt_parts) if adapt_parts else 'none (baseline)'}")
     print(f"{'='*60}\n")
 
-    # Tracks overall progress across all epochs.
     epoch_bar = tqdm(
         range(1, args.epochs + 1),
         desc="  Epochs", unit="ep",
@@ -316,101 +432,141 @@ def train(args):
 
     for epoch in epoch_bar:
 
-        # Phase transition: partial unfreeze
-        if epoch == args.warmup_epochs + 1:
-            tqdm.write(f"\n── Phase 2: unfreezing last {finetune_blocks} blocks ──")
-            model.unfreeze_last_blocks(n=finetune_blocks)
+        # Determine sub-phase and apply any transitions
 
-            if use_dann:
-                global_step = 0
-                total_steps = steps_per_epoch * (args.epochs - args.warmup_epochs)
-                tqdm.write("  [DANN] λ reset to 0 for Phase 2.")
+        if not use_supcon:
+            # Standard two-phase schedule.
+            if epoch == args.warmup_epochs + 1:
+                # Transition: Phase 1 -> Phase 2.
+                tqdm.write(
+                    f"\nPhase 2: unfreezing last {finetune_blocks} encoder blocks."
+                )
+                model.unfreeze_last_blocks(n=finetune_blocks)
+                backbone_params = [p for p in model.backbone.parameters()
+                                   if p.requires_grad]
+                head_params     = list(model.head.parameters())
+                optimizer = AdamW(
+                    [
+                        {"params": backbone_params, "lr": args.lr * 0.02},
+                        {"params": head_params,     "lr": args.lr},
+                    ],
+                    weight_decay=1e-4,
+                )
+                scheduler = CosineAnnealingLR(
+                    optimizer, T_max=args.epochs - args.warmup_epochs
+                )
+            sub_phase       = "1" if epoch <= args.warmup_epochs else "2"
+            use_supcon_now  = False
+            active_crit     = ce_criterion
 
-            # Separate param groups: unfrozen backbone at lr×0.02, head at lr
-            backbone_params = [p for p in model.backbone.parameters()
-                               if p.requires_grad]
-            head_params     = list(model.head.parameters())
-            if use_dann:
-                head_params += list(model.domain_classifier.parameters())
-
-            optimizer = AdamW(
-                [
-                    {"params": backbone_params, "lr": args.lr * 0.02},
-                    {"params": head_params,     "lr": args.lr},
-                ],
-                weight_decay=1e-4,
-            )
-            scheduler = CosineAnnealingLR(
-                optimizer,
-                T_max=args.epochs - args.warmup_epochs,
-            )
-
-        phase = "warmup" if epoch <= args.warmup_epochs else "finetune"
-        t0    = time.time()
-
-        # Train
-        dann_cls_loss    = ""
-        dann_domain_loss = ""
-
-        if use_dann:
-            dann_cls, dann_dom, train_loss, global_step = dann_train_one_epoch(
-                model=model, source_loader=train_loader, target_loader=target_loader,
-                optimizer=optimizer, cls_criterion=criterion, device=device,
-                epoch=epoch, total_epochs=args.epochs, phase=phase,
-                global_step=global_step, total_steps=total_steps,
-                dann_weight=dann_weight,
-            )
-            dann_cls_loss    = f"{dann_cls:.6f}"
-            dann_domain_loss = f"{dann_dom:.6f}"
         else:
-            train_loss = train_one_epoch(
-                model, train_loader, optimizer, criterion,
-                device, epoch, args.epochs, phase,
-            )
+            # SupCon three-sub-stage schedule.
+            if epoch == supcon_freeze_end + 1 and supcon_freeze_end < args.warmup_epochs:
+                # Transition: Phase 1a -> Phase 1b.
+                # Unfreeze full backbone at a small LR; projection head at full LR.
+                tqdm.write(
+                    f"\nPhase 1b: backbone fully unfrozen for contrastive shaping "
+                    f"(backbone LR = {args.lr * 0.01})."
+                )
+                model.unfreeze_backbone()
+                backbone_params = list(model.backbone.parameters())
+                proj_params     = list(model.proj_head.parameters())
+                # Classification head still excluded — not trained until Phase 2.
+                optimizer = AdamW(
+                    [
+                        {"params": backbone_params, "lr": args.lr * 0.01},
+                        {"params": proj_params,     "lr": args.lr},
+                    ],
+                    weight_decay=1e-4,
+                )
+                # Re-initialise scheduler over the remaining warmup epochs.
+                remaining_warmup = args.warmup_epochs - supcon_freeze_end
+                scheduler = CosineAnnealingLR(
+                    optimizer, T_max=max(remaining_warmup, 1)
+                )
 
-        # Evaluate on both validation sets
-        val_day_m   = evaluate(model, val_day_loader,   criterion, device,
-                               num_classes, epoch, args.epochs, "ValDay")
-        val_night_m = evaluate(model, val_night_loader, criterion, device,
-                               num_classes, epoch, args.epochs, "ValNight")
+            elif epoch == args.warmup_epochs + 1:
+                # Transition: Phase 1b -> Phase 2.
+                # Re-freeze backbone, then unfreeze only the last N blocks.
+                tqdm.write(
+                    f"\nPhase 2: re-freezing backbone, unfreezing last "
+                    f"{finetune_blocks} encoder blocks. Switching to cross-entropy."
+                )
+                model.unfreeze_last_blocks(n=finetune_blocks)
+                backbone_params = [p for p in model.backbone.parameters()
+                                   if p.requires_grad]
+                # Classification head enters training for the first time.
+                # Projection head excluded — discarded after Phase 1.
+                head_params = list(model.head.parameters())
+                optimizer = AdamW(
+                    [
+                        {"params": backbone_params, "lr": args.lr * 0.02},
+                        {"params": head_params,     "lr": args.lr},
+                    ],
+                    weight_decay=1e-4,
+                )
+                scheduler = CosineAnnealingLR(
+                    optimizer, T_max=args.epochs - args.warmup_epochs
+                )
+
+            if epoch <= supcon_freeze_end:
+                sub_phase      = "1a"
+                use_supcon_now = True
+                active_crit    = supcon_criterion
+            elif epoch <= args.warmup_epochs:
+                sub_phase      = "1b"
+                use_supcon_now = True
+                active_crit    = supcon_criterion
+            else:
+                sub_phase      = "2"
+                use_supcon_now = False
+                active_crit    = ce_criterion
+
+        t0 = time.time()
+
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, active_crit,
+            device, epoch, args.epochs, sub_phase, use_supcon_now,
+        )
+
+        # Evaluation always uses cross-entropy for consistent loss reporting.
+        val_night_m = evaluate(
+            model, val_night_loader, ce_criterion,
+            device, num_classes, epoch, args.epochs, "ValNight",
+        )
         scheduler.step()
 
         elapsed = time.time() - t0
 
-        # Logging
         epoch_bar.set_postfix(
-            phase=phase,
+            phase=sub_phase,
             tr=f"{train_loss:.4f}",
-            vd_F1=f"{val_day_m['macro_f1']:.3f}",
             vn_F1=f"{val_night_m['macro_f1']:.3f}",
         )
 
-        dann_str = ""
-        if use_dann and dann_cls_loss:
-            lam = compute_lambda(global_step, total_steps)
-            dann_str = f"  cls={dann_cls_loss}  dom={dann_domain_loss}  λ={lam:.3f}"
-
         tqdm.write(
-            f"  Epoch {epoch:>3}/{args.epochs} [{phase:>8}]  "
-            f"train_loss={train_loss:.4f}{dann_str}  "
-            f"val_day[loss={val_day_m['loss']:.4f} acc={val_day_m['accuracy']:.4f} "
-            f"F1={val_day_m['macro_f1']:.4f}]  "
-            f"val_night[loss={val_night_m['loss']:.4f} acc={val_night_m['accuracy']:.4f} "
-            f"F1={val_night_m['macro_f1']:.4f}]  "
+            f"  Epoch {epoch:>3}/{args.epochs} [phase {sub_phase}]  "
+            f"train_loss={train_loss:.4f}  "
+            f"val_night(loss={val_night_m['loss']:.4f}  "
+            f"acc={val_night_m['accuracy']:.4f}  "
+            f"F1={val_night_m['macro_f1']:.4f})  "
             f"({elapsed:.0f}s)"
         )
 
         logger.writerow([
-            epoch, phase,
+            epoch, sub_phase,
             f"{train_loss:.6f}",
-            dann_cls_loss, dann_domain_loss,
-            f"{val_day_m['loss']:.6f}",   f"{val_day_m['accuracy']:.6f}",   f"{val_day_m['macro_f1']:.6f}",
-            f"{val_night_m['loss']:.6f}", f"{val_night_m['accuracy']:.6f}", f"{val_night_m['macro_f1']:.6f}",
+            f"{val_night_m['loss']:.6f}",
+            f"{val_night_m['accuracy']:.6f}",
+            f"{val_night_m['macro_f1']:.6f}",
         ])
         log_file.flush()
 
-        # Checkpoint
-        if val_night_m["macro_f1"] > best_f1:
+        # Checkpoint only in phase 2 or when SupCon is off (phase 1 or 2).
+        # During SupCon phases 1a/1b the classification head is not being
+        # trained, so val_night_f1 is not yet meaningful for checkpointing.
+        should_checkpoint = (sub_phase == "2") or (not use_supcon)
+        if should_checkpoint and val_night_m["macro_f1"] > best_f1:
             best_f1    = val_night_m["macro_f1"]
             best_epoch = epoch
             torch.save(
@@ -421,39 +577,47 @@ def train(args):
                     "idx2label":      idx2label,
                     "num_classes":    num_classes,
                     "args":           vars(args),
-                    "use_dann":       use_dann,
+                    "use_supcon":     use_supcon,
                     "use_data_adapt": use_data_adapt,
                 },
                 best_path,
             )
-            tqdm.write(f" Best model saved (val_night macro-F1 = {best_f1:.4f})")
+            tqdm.write(
+                f"  Best model saved at epoch {epoch} "
+                f"(val_night macro-F1 = {best_f1:.4f})."
+            )
 
     log_file.close()
     tqdm.write(
-        f"\nTraining complete.  Best val_night macro-F1 = {best_f1:.4f} at epoch {best_epoch}."
+        f"\nTraining complete. Best val_night macro-F1 = {best_f1:.4f} "
+        f"at epoch {best_epoch}."
         f"\n  Checkpoint : {best_path}"
         f"\n  Log        : {log_path}"
     )
 
 # Entry point
 def parse_args():
-    p = argparse.ArgumentParser(description="Train DINOv2-base on camera-trap images.")
+    p = argparse.ArgumentParser(
+        description="Train DINOv2-base on camera-trap images."
+    )
     p.add_argument("--data_root",       default="./data")
     p.add_argument("--output_dir",      default="./outputs")
     p.add_argument("--run_ts",          default="run")
     p.add_argument("--epochs",          type=int,   default=50)
     p.add_argument("--warmup_epochs",   type=int,   default=15)
-    p.add_argument("--finetune_blocks", type=int,   default=2,
-                   help="Number of last transformer blocks to unfreeze in Phase 2")
-    p.add_argument("--batch_size",      type=int,   default=16)
+    p.add_argument("--finetune_blocks", type=int,   default=3,
+                   help="Number of trailing encoder blocks to unfreeze in Phase 2.")
+    p.add_argument("--batch_size",      type=int,   default=64)
     p.add_argument("--lr",              type=float, default=1e-4)
     p.add_argument("--num_workers",     type=int,   default=4)
-    p.add_argument("--use_data_adapt",  action="store_true")
-    p.add_argument("--da_strength",     default="medium",
-                   choices=["light", "medium", "strong"])
-    p.add_argument("--use_dann",        action="store_true")
-    p.add_argument("--dann_weight",     type=float, default=1.0)
+    p.add_argument("--use_data_adapt",  action="store_true",
+                   help="Append night-simulated copies of daytime images to the "
+                        "training set.")
+    p.add_argument("--use_supcon",      action="store_true",
+                   help="Use supervised contrastive loss during the warmup phase "
+                        "instead of cross-entropy.")
     return p.parse_args()
+
 
 if __name__ == "__main__":
     train(parse_args())

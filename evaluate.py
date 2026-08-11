@@ -16,13 +16,20 @@ from train import Dinov2Classifier
 
 # Inference
 @torch.no_grad()
-def get_predictions(model, loader, device, num_classes):
+def get_predictions(model, loader, device):
+    """
+    Run the model over `loader` and collect:
+      all_labels : (N,)     true integer class indices
+      all_preds  : (N,)     argmax predictions
+      all_probs  : (N, C)   softmax probability vectors
+    """
     model.eval()
     all_labels, all_preds, all_probs = [], [], []
 
     for imgs, labels in loader:
-        imgs = imgs.to(device)
-        logits = model(imgs)
+        imgs   = imgs.to(device)
+        output = model(imgs)
+        logits = output[0] if isinstance(output, tuple) else output
         probs  = F.softmax(logits, dim=1)
         preds  = logits.argmax(dim=1)
         all_labels.extend(labels.tolist())
@@ -37,34 +44,27 @@ def get_predictions(model, loader, device, num_classes):
 
 # Metric helpers
 def per_class_binary_counts(y_true, y_pred, num_classes):
-    """
-    For each class c, treat it as a one-vs-rest binary problem and count: TP, TN, FP, FN
-    Returns four arrays of shape (num_classes,).
-    """
+    """One-vs-rest TP, TN, FP, FN for each class."""
     tp = np.zeros(num_classes, dtype=int)
     tn = np.zeros(num_classes, dtype=int)
     fp = np.zeros(num_classes, dtype=int)
     fn = np.zeros(num_classes, dtype=int)
 
     for c in range(num_classes):
-        binary_true = (y_true == c).astype(int)
-        binary_pred = (y_pred == c).astype(int)
-        tp[c] = ((binary_pred == 1) & (binary_true == 1)).sum()
-        tn[c] = ((binary_pred == 0) & (binary_true == 0)).sum()
-        fp[c] = ((binary_pred == 1) & (binary_true == 0)).sum()
-        fn[c] = ((binary_pred == 0) & (binary_true == 1)).sum()
+        bt = (y_true == c).astype(int)
+        bp = (y_pred == c).astype(int)
+        tp[c] = ((bp == 1) & (bt == 1)).sum()
+        tn[c] = ((bp == 0) & (bt == 0)).sum()
+        fp[c] = ((bp == 1) & (bt == 0)).sum()
+        fn[c] = ((bp == 0) & (bt == 1)).sum()
 
     return tp, tn, fp, fn
 
 def safe_divide(num, denom):
-    """Element-wise division, returning 0 where denom == 0."""
     return np.where(denom > 0, num / denom, 0.0)
 
 def compute_roc_auc(y_true_binary, y_score):
-    """
-    Compute AUC-ROC for a single binary problem.
-    """
-    # Sort by descending score
+    """AUC-ROC via trapezoidal rule for one binary problem."""
     order   = np.argsort(-y_score)
     y_true_ = y_true_binary[order]
 
@@ -87,9 +87,13 @@ def compute_roc_auc(y_true_binary, y_score):
     fpr = np.concatenate([[0.0], np.array(fp_arr) / n_neg])
     return float(np.trapezoid(tpr, fpr))
 
+
 def compute_pr_curve(y_true_binary, y_score):
     """
     Compute precision-recall curve for one binary problem.
+
+    Returns (precision, recall) arrays starting at recall=0.
+    Uses the step-function interpolation convention (no smoothing).
     """
     order   = np.argsort(-y_score)
     y_true_ = y_true_binary[order]
@@ -124,6 +128,7 @@ def compute_pr_auc(precision, recall):
     """Area under the PR curve via trapezoidal rule."""
     return float(np.trapezoid(precision, recall))
 
+# Confusion matrix
 def build_confusion_matrix(y_true, y_pred, num_classes):
     """Return a (num_classes, num_classes) row-normalised fraction matrix."""
     cm_counts = np.zeros((num_classes, num_classes), dtype=int)
@@ -139,18 +144,17 @@ def build_confusion_matrix(y_true, y_pred, num_classes):
 def compute_all_metrics(y_true, y_pred, y_probs, num_classes, idx2label):
     tp, tn, fp, fn = per_class_binary_counts(y_true, y_pred, num_classes)
 
-    sensitivity = safe_divide(tp, tp + fn)
-    specificity = safe_divide(tn, tn + fp)
-    precision = safe_divide(tp, tp + fp)
-    f1 = safe_divide(2 * tp, 2 * tp + fp + fn)
-    # Accuracy for class c in one-vs-rest sense
-    acc_per_cls = safe_divide(tp + tn,  tp + tn + fp + fn)
+    sensitivity = safe_divide(tp,      tp + fn)
+    specificity = safe_divide(tn,      tn + fp)
+    precision   = safe_divide(tp,      tp + fp)
+    f1          = safe_divide(2 * tp,  2 * tp + fp + fn)
+    acc_per_cls = safe_divide(tp + tn, tp + tn + fp + fn)
 
     auc_roc_per_cls = np.array([
-            compute_roc_auc((y_true == c).astype(int), y_probs[:, c])
-            for c in range(num_classes)
-        ])
-    
+        compute_roc_auc((y_true == c).astype(int), y_probs[:, c])
+        for c in range(num_classes)
+    ])
+
     pr_curves = []
     pr_auc_per_cls = np.zeros(num_classes)
     for c in range(num_classes):
@@ -196,11 +200,17 @@ def compute_all_metrics(y_true, y_pred, y_probs, num_classes, idx2label):
 
 # Reporting
 def save_confusion_matrix(cm_counts, cm_frac, class_names, out_path):
-    n = len(class_names)
+    """
+    Save row-normalised confusion matrix heatmap.
+
+    Cell values are displayed as fractions (e.g. 0.900).
+    Colour intensity reflects the fraction.
+    """
+    n   = len(class_names)
     fig, ax = plt.subplots(figsize=(max(8, n), max(6, n - 2)))
 
-    im = ax.imshow(cm_frac, interpolation="nearest", cmap="Blues")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    im = ax.imshow(cm_frac, interpolation="nearest", cmap="Blues", vmin=0, vmax=1)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Fraction")
 
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
@@ -208,7 +218,7 @@ def save_confusion_matrix(cm_counts, cm_frac, class_names, out_path):
     ax.set_yticklabels(class_names, fontsize=9)
     ax.set_xlabel("Predicted", fontsize=11)
     ax.set_ylabel("True",      fontsize=11)
-    ax.set_title("Confusion Matrix — voc_night (test)", fontsize=13)
+    ax.set_title("Confusion Matrix — voc_night (row-normalised fractions)", fontsize=13)
 
     thresh = 0.5
     for i in range(n):
@@ -221,7 +231,8 @@ def save_confusion_matrix(cm_counts, cm_frac, class_names, out_path):
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Confusion matrix figure : {out_path}")
+    print(f"Confusion matrix figure saved: {out_path}")
+
 
 def save_pr_auc_plot(metrics, class_names, out_path):
     """
@@ -251,7 +262,8 @@ def save_pr_auc_plot(metrics, class_names, out_path):
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"PR-AUC plot : {out_path}")
+    print(f"PR-AUC plot saved: {out_path}")
+
 
 def save_text_report(metrics, out_path):
     ov = metrics["overall"]
@@ -293,7 +305,7 @@ def save_text_report(metrics, out_path):
     report = "\n".join(lines)
     print("\n" + report)
     out_path.write_text(report)
-    print(f"\nReport saved : {out_path}")
+    print(f"Report saved: {out_path}")
 
 
 def save_per_class_csv(metrics, out_path):
@@ -306,7 +318,9 @@ def save_per_class_csv(metrics, out_path):
         for pc in metrics["per_class"]:
             w.writerow({k: (f"{pc[k]:.6f}" if isinstance(pc[k], float) else pc[k])
                         for k in fields})
-    print(f"Per-class CSV  : {out_path}")
+    print(f"Per-class CSV saved: {out_path}")
+
+
 
 # Main
 def evaluate(args):
@@ -321,44 +335,41 @@ def evaluate(args):
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    # Load checkpoint
-    ckpt       = torch.load(checkpoint_path, map_location=device)
-    label2idx  = ckpt["label2idx"]
-    idx2label  = {int(k): v for k, v in ckpt["idx2label"].items()}
+    ckpt        = torch.load(checkpoint_path, map_location=device)
+    label2idx   = ckpt["label2idx"]
+    idx2label   = {int(k): v for k, v in ckpt["idx2label"].items()}
     num_classes = ckpt["num_classes"]
     run_ts      = getattr(args, "run_ts", "run")
+    use_supcon  = ckpt.get("use_supcon", False)
 
-    print(f"Checkpoint: epoch {ckpt['epoch']}  |  {num_classes} classes")
+    print(f"Checkpoint: epoch {ckpt['epoch']}, {num_classes} classes.")
 
-    # Reconstruct correct model class from checkpoint metadata
-    use_dann = ckpt.get("use_dann", False)
-    if use_dann:
-        from dann import DomainAdversarialModel
-        model = DomainAdversarialModel(num_classes=num_classes).to(device)
-    else:
-        model = Dinov2Classifier(num_classes=num_classes).to(device)
-
+    model = Dinov2Classifier(
+        num_classes=num_classes, use_supcon=use_supcon
+    ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    # Use the test split (80% of voc_night)
-    _, _, test_ds, _, _, _ = build_datasets(args.data_root)
-    _, _, test_loader, _ = get_dataloaders(
-        test_ds, test_ds, test_ds, test_ds,
+    # Use the 80% test split of voc_night.
+    _, test_ds, _, _, _ = build_datasets(
+        args.data_root, use_data_adapt=False
+    )
+    _, test_loader, _ = get_dataloaders(
+        test_ds, test_ds, test_ds,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
 
-    print("\nRunning inference on voc_night test split …")
+    print("\nRunning inference on voc_night test split.")
     y_true, y_pred, y_probs = get_predictions(model, test_loader, device)
     print(f"Samples evaluated: {len(y_true)}")
 
     metrics = compute_all_metrics(y_true, y_pred, y_probs, num_classes, idx2label)
 
-    out_dir = Path(args.output_dir)
+    out_dir     = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     class_names = [idx2label[c] for c in range(num_classes)]
-    ts = run_ts
+    ts          = run_ts
 
     save_text_report(metrics,   out_dir / f"evaluation_report_{ts}.txt")
     save_per_class_csv(metrics, out_dir / f"metrics_per_class_{ts}.csv")
@@ -366,15 +377,18 @@ def evaluate(args):
 
     cm_counts, cm_frac = build_confusion_matrix(y_true, y_pred, num_classes)
     save_confusion_matrix(cm_counts, cm_frac, class_names,
-                            out_dir / f"confusion_matrix_{ts}.png")
+                          out_dir / f"confusion_matrix_{ts}.png")
 
     with open(out_dir / f"confusion_matrix_{ts}.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["true \\ pred"] + class_names)
+        w.writerow(["true vs pred"] + class_names)
         for i, row in enumerate(cm_frac):
             w.writerow([class_names[i]] + [f"{v:.6f}" for v in row])
-    print(f"Confusion CSV  : {out_dir / f'confusion_matrix_{ts}.csv'}")
+    print(f"Confusion matrix CSV saved: {out_dir / f'confusion_matrix_{ts}.csv'}")
 
+
+
+# Entry point
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained DINOv2 on voc_night.")
     p.add_argument("--checkpoint",  default="outputs/best_model.pt")

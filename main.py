@@ -1,6 +1,7 @@
 import argparse
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,175 +9,190 @@ from dataset import build_datasets, get_dataloaders
 from train import train, Dinov2Classifier
 import evaluate as eval_module
 
-# Configurations
+
+
+# Fixed output path and default data root
+DATA_ROOT  = "./data"
+OUTPUT_DIR = "./outputs"
+
+
+# Default configuration
 CONFIG = dict(
-    data_root      = "data",
-    output_dir     = "outputs",
-    epochs         = 20,
-    warmup_epochs  = 5,
-    batch_size     = 16,
-    lr             = 1e-4,
-    num_workers    = 4,
-    use_data_adapt = False,
-    da_strength    = "medium",
-    use_dann       = False,
-    dann_weight    = 0.2,
+    epochs          = 50,
+    warmup_epochs   = 15,
+    finetune_blocks = 3,
+    batch_size      = 64,
+    lr              = 1e-4,
+    num_workers     = 4,
+    use_data_adapt  = False,
+    use_supcon      = False,
 )
 
+
+
+# Utilities
 def banner(title: str, width: int = 60):
-    print(f"\n{'='*width}")
+    print(f"\n{'=' * width}")
     pad = (width - len(title) - 2) // 2
-    print(f"{'='*pad} {title} {'='*(width - pad - len(title) - 2)}")
-    print(f"{'='*width}\n")
+    print(f"{'=' * pad} {title} {'=' * (width - pad - len(title) - 2)}")
+    print(f"{'=' * width}\n")
 
-# Step 1 — Verify
+
+
+# Step 1 - Verify
 def step_verify(cfg) -> tuple:
-    """Scan both splits and return (train_ds, test_ds, label2idx, idx2label)."""
-    banner("STEP 1 / 3  —  DATA VERIFICATION")
+    """Scan both dataset splits and report sample counts."""
+    banner("STEP 1 / 3  -  DATA VERIFICATION")
 
-    train_ds, test_ds, label2idx, idx2label = build_datasets(cfg.data_root)
+    train_ds, test_ds, val_night_ds, label2idx, idx2label = \
+        build_datasets(cfg.data_root, use_data_adapt=cfg.use_data_adapt)
 
     if len(train_ds) == 0:
-        print("[ERROR] Training set is empty. Check voc_day/Annotations and voc_day/JPEGImages.")
+        print("Error: training set is empty. "
+              "Check voc_day/Annotations and voc_day/JPEGImages.")
         sys.exit(1)
     if len(test_ds) == 0:
-        print("[ERROR] Test set is empty. Check voc_night/Annotations and voc_night/JPEGImages.")
+        print("Error: test set is empty. "
+              "Check voc_night/Annotations and voc_night/JPEGImages.")
         sys.exit(1)
 
-    print(f"  Train samples : {len(train_ds)}")
-    print(f"  Test samples  : {len(test_ds)}")
+    print(f"  Train      : {len(train_ds)}")
+    print(f"  Test       : {len(test_ds)}")
+    print(f"  Val night  : {len(val_night_ds)}")
     print(f"  Classes ({len(label2idx)}) : {sorted(label2idx)}")
-    print("\n Data verification passed.")
+    print("\n  Data verification passed.")
 
-    return train_ds, test_ds, label2idx, idx2label
+    return train_ds, test_ds, val_night_ds, label2idx, idx2label
 
-# Step 2 — Train
+
+
+# Step 2 - Train
 def step_train(cfg):
     """Run the two-phase training loop and save the best checkpoint."""
-    banner("STEP 2 / 3  —  TRAINING")
+    banner("STEP 2 / 3  -  TRAINING")
 
-    # Print active adaptation summary before training starts
-    adapt_active = []
-    if getattr(cfg, "use_data_adapt", False):
-        adapt_active.append(
-            f"Data-level adaptation (strength={getattr(cfg, 'da_strength', 'medium')})"
-        )
-    if getattr(cfg, "use_dann", False):
-        adapt_active.append(
-            f"Feature-level DANN (dann_weight={getattr(cfg, 'dann_weight', 0.2)})"
-        )
-    if adapt_active:
-        print("Active domain adaptation modules:")
-        for m in adapt_active:
-            print(f"    • {m}")
+    options = []
+    if cfg.use_data_adapt:
+        options.append("data adaptation (medium)")
+    if cfg.use_supcon:
+        options.append("supervised contrastive loss")
+    if options:
+        print(f"  Active options: {', '.join(options)}")
     else:
-        print("Domain adaptation: none (baseline mode)")
+        print("  Active options: none (baseline mode)")
     print()
 
     t0 = time.time()
     train(cfg)
     elapsed = time.time() - t0
 
-    checkpoint = Path(cfg.output_dir) / "best_model.pt"
+    checkpoint = Path(cfg.output_dir) / f"best_model_{cfg.run_ts}.pt"
     if not checkpoint.exists():
-        print("[ERROR] Training finished but no checkpoint was saved.")
+        print("Error: training finished but no checkpoint was saved.")
         sys.exit(1)
 
     mins, secs = divmod(int(elapsed), 60)
-    print(f"\n Training complete in {mins}m {secs}s.")
+    print(f"\n  Training complete in {mins}m {secs}s.")
     print(f"  Checkpoint : {checkpoint}")
 
-# Step 3 — Evaluate
+
+
+# Step 3 - Evaluate
 def step_evaluate(cfg):
     """Load the best checkpoint and run the full evaluation suite."""
-    banner("STEP 3 / 3  —  EVALUATION")
+    banner("STEP 3 / 3  -  EVALUATION")
 
     eval_args = SimpleNamespace(
-        checkpoint  = str(Path(cfg.output_dir) / "best_model.pt"),
+        checkpoint  = str(Path(cfg.output_dir) / f"best_model_{cfg.run_ts}.pt"),
         data_root   = cfg.data_root,
         output_dir  = cfg.output_dir,
+        run_ts      = cfg.run_ts,
         batch_size  = cfg.batch_size,
         num_workers = cfg.num_workers,
     )
 
     eval_module.evaluate(eval_args)
 
+    ts  = cfg.run_ts
     out = Path(cfg.output_dir)
-    print(f"\n  Evaluation complete. Outputs in {out}/")
-    print(f" {out}/evaluation_report.txt")
-    print(f" {out}/metrics_per_class.csv")
-    print(f" {out}/confusion_matrix.png")
-    print(f" {out}/confusion_matrix.csv")
+    print(f"\n  Evaluation complete. Outputs written to {out}/")
+    print(f"    evaluation_report_{ts}.txt")
+    print(f"    metrics_per_class_{ts}.csv")
+    print(f"    confusion_matrix_{ts}.png")
+    print(f"    confusion_matrix_{ts}.csv")
+    print(f"    pr_auc_{ts}.png")
 
-# Summary footer
+
+
+# Summary
 def print_summary(cfg, total_elapsed: float):
     banner("PIPELINE COMPLETE", width=60)
     mins, secs = divmod(int(total_elapsed), 60)
-    print(f"  Total wall time : {mins}m {secs}s")
-    print(f"  Outputs         : {Path(cfg.output_dir).resolve()}")
+    print(f"  Run ID     : {cfg.run_ts}")
+    print(f"  Wall time  : {mins}m {secs}s")
+    print(f"  Outputs    : {Path(cfg.output_dir).resolve()}")
     print()
 
 # CLI
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Wildlife camera-trap classifier — full pipeline (DINOv2-base).",
+        description="Wildlife camera-trap classifier - DINOv2-base pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data_root",     default=CONFIG["data_root"],
-                   help="Root directory containing voc_day/ and voc_night/")
-    p.add_argument("--output_dir",    default=CONFIG["output_dir"],
-                   help="Directory for checkpoints, logs, and evaluation outputs")
-    p.add_argument("--epochs",        type=int,   default=CONFIG["epochs"])
-    p.add_argument("--warmup_epochs", type=int,   default=CONFIG["warmup_epochs"],
-                   help="Epochs to train the classification head with the backbone frozen")
-    p.add_argument("--batch_size",    type=int,   default=CONFIG["batch_size"],
-                   help="Reduce to 8 if GPU runs out of memory")
-    p.add_argument("--lr",            type=float, default=CONFIG["lr"],
-                   help="Head learning rate; backbone uses lr × 0.1 during fine-tune phase")
-    p.add_argument("--num_workers",   type=int,   default=CONFIG["num_workers"],
-                   help="DataLoader workers — use 0 on Windows or for debugging")
-    # Data-level adaptation
-    p.add_argument("--use_data_adapt", action="store_true",
-                    default=CONFIG["use_data_adapt"],
-                    help=" Apply night-simulation augmentations to training images")
-    p.add_argument("--da_strength",   default=CONFIG["da_strength"],
-                    choices=["light", "medium", "strong"],
-                    help=" Night-simulation intensity (used with --use_data_adapt)")
-    # Feature-level DANN
-    p.add_argument("--use_dann",      action="store_true",
-                    default=CONFIG["use_dann"],
-                    help=" Enable domain-adversarial training (DANN)")
-    p.add_argument("--dann_weight",   type=float, default=CONFIG["dann_weight"],
-                    help=" Scale on DANN domain loss (used with --use_dann)")
+    p.add_argument("--data_root",       default=DATA_ROOT,
+                   help="Root directory containing voc_day/ and voc_night/.")
+    p.add_argument("--epochs",          type=int,   default=CONFIG["epochs"])
+    p.add_argument("--warmup_epochs",   type=int,   default=CONFIG["warmup_epochs"],
+                   help="Epochs to train with backbone fully frozen.")
+    p.add_argument("--finetune_blocks", type=int,   default=CONFIG["finetune_blocks"],
+                   help="Number of trailing encoder blocks to unfreeze in Phase 2.")
+    p.add_argument("--batch_size",      type=int,   default=CONFIG["batch_size"],
+                   help="Training and evaluation batch size.")
+    p.add_argument("--lr",              type=float, default=CONFIG["lr"],
+                   help="Head learning rate. Backbone uses lr * 0.02 in Phase 2.")
+    p.add_argument("--num_workers",     type=int,   default=CONFIG["num_workers"],
+                   help="DataLoader worker processes.")
+    p.add_argument("--use_data_adapt",  action="store_true",
+                   default=CONFIG["use_data_adapt"],
+                   help="Append night-simulated copies of daytime training images.")
+    p.add_argument("--use_supcon",      action="store_true",
+                   default=CONFIG["use_supcon"],
+                   help="Use supervised contrastive loss during the warmup phase.")
     return p.parse_args()
 
 # Entry point
 def main():
-    args = parse_args()
-    cfg = args
+    args   = parse_args()
+    run_ts = datetime.now().strftime("%d_%m_%y_%H_%M_%S")
 
-    banner("WILDLIFE SPECIES CLASSIFIER  —  DINOv2-BASE BASELINE", width=60)
-    print(f"  data_root     : {cfg.data_root}")
-    print(f"  output_dir    : {cfg.output_dir}")
-    print(f"  epochs        : {cfg.epochs}  (warmup: {cfg.warmup_epochs})")
-    print(f"  batch_size    : {cfg.batch_size}")
-    print(f"  learning rate : {cfg.lr}  (backbone: {cfg.lr * 0.1})")
-    print(f"  num_workers   : {cfg.num_workers}")
-    print(f"  data_adapt    : {'ON  (strength=' + cfg.da_strength + ')' if cfg.use_data_adapt else 'OFF'}")
-    print(f"  DANN          : {'ON  (weight=' + str(cfg.dann_weight) + ')' if cfg.use_dann else 'OFF'}")
+    cfg = SimpleNamespace(
+        **vars(args),
+        output_dir = OUTPUT_DIR,
+        run_ts     = run_ts,
+    )
+
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+    banner("WILDLIFE SPECIES CLASSIFIER  -  DINOv2-BASE", width=60)
+    print(f"  Run ID         : {cfg.run_ts}")
+    print(f"  Data root      : {cfg.data_root}")
+    print(f"  Output dir     : {cfg.output_dir}")
+    print(f"  Epochs         : {cfg.epochs} "
+          f"(warmup: {cfg.warmup_epochs}, finetune blocks: {cfg.finetune_blocks})")
+    print(f"  Batch size     : {cfg.batch_size}")
+    print(f"  Learning rate  : {cfg.lr} (backbone: {cfg.lr * 0.02})")
+    print(f"  Workers        : {cfg.num_workers}")
+    print(f"  Data adapt     : {'on' if cfg.use_data_adapt else 'off'}")
+    print(f"  SupCon         : {'on' if cfg.use_supcon else 'off'}")
 
     t_start = time.time()
 
-    # Step 1 — verify data
     step_verify(cfg)
-
-    # Step 2 — train (unless --eval_only)
     step_train(cfg)
-
-    # Step 3 — evaluate
     step_evaluate(cfg)
 
     print_summary(cfg, time.time() - t_start)
+
 
 if __name__ == "__main__":
     main()
