@@ -6,27 +6,36 @@ from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import ConcatDataset, Dataset, DataLoader
 from torchvision import transforms
 
+
+
+# Constants
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
-# ImageNet statistics
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
-# DINOv2-base crops
 IMAGE_SIZE = 224
 
 # Fractional padding added around each bounding box before cropping.
 BBOX_PAD_FRAC = 0.05
+
+# Reproducibility seed for the night split.
 SPLIT_SEED = 42
+
+# Type alias for bounding box coordinates.
 BBox = Optional[Tuple[int, int, int, int]]
+
+# Default data root.
+DATA_ROOT = "./data"
+
 
 
 # Transforms
 def get_train_transforms() -> transforms.Compose:
-    """Augmentation-heavy pipeline for the daytime training split."""
+    """Standard augmentation pipeline for daytime training images."""
     return transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -37,68 +46,56 @@ def get_train_transforms() -> transforms.Compose:
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
+
 def get_eval_transforms() -> transforms.Compose:
-    """Deterministic pipeline for validation and test splits."""
+    """Deterministic pipeline for validation and test images."""
     return transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
-def get_test_transforms() -> transforms.Compose:
-    """Minimal, deterministic pipeline for the nighttime test split."""
-    return transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
+
 
 # XML parsing
-def parse_voc_annotation(xml_path: Path) -> Optional[str]:
+def parse_voc_annotation(xml_path: Path) -> Tuple[Optional[str], BBox]:
     """
-    Return the first species label found in a Pascal VOC XML annotation.
+    Parse a Pascal VOC XML annotation file.
 
-    Returns None if the file is malformed or contains no <object> tags.
+    Returns (label, bbox) where bbox is (xmin, ymin, xmax, ymax) in pixel
+    coordinates, or None if no valid bounding box is present.
+    Returns (None, None) if the file has no object element.
     """
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        obj = root.find("object")
-        if obj is None:
-            return None, None
-        
-        # Species labels
-        name_el = obj.find("name")
-        if name_el is None or name_el.text is None:
-            return None, None
-        label =  name_el.text.strip()
-
-        # Bounding box
-        bndbox = obj.find("bndbox")
-        bbox   = None
-        if bndbox is not None:
-            try:
-                xmin = int(float(bndbox.findtext("xmin")))
-                ymin = int(float(bndbox.findtext("ymin")))
-                xmax = int(float(bndbox.findtext("xmax")))
-                ymax = int(float(bndbox.findtext("ymax")))
-                # Box must have positive area
-                if xmax > xmin and ymax > ymin:
-                    bbox = (xmin, ymin, xmax, ymax)
-            except (TypeError, ValueError):
-                pass # else return to full image
- 
-        return label, bbox
-    except ET.ParseError:
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    obj  = root.find("object")
+    if obj is None:
         return None, None
 
-# Dataset scanning
-def scan_voc_split(split_dir: Path) -> List[Tuple[Path, str]]:
-    """
-    Walk a voc_<split> directory and return a list of (image_path, label).
+    name_el = obj.find("name")
+    if name_el is None or name_el.text is None:
+        return None, None
+    label = name_el.text.strip()
 
-    Only images that have a matching XML annotation are included.
-    Annotations without a discoverable image file are skipped with a warning.
+    bndbox = obj.find("bndbox")
+    bbox   = None
+    if bndbox is not None:
+        xmin = int(float(bndbox.findtext("xmin")))
+        ymin = int(float(bndbox.findtext("ymin")))
+        xmax = int(float(bndbox.findtext("xmax")))
+        ymax = int(float(bndbox.findtext("ymax")))
+        if xmax > xmin and ymax > ymin:
+            bbox = (xmin, ymin, xmax, ymax)
+
+    return label, bbox
+
+
+
+# Dataset scanning
+def scan_voc_split(split_dir: Path) -> List[Tuple[Path, str, BBox]]:
+    """
+    Scan a voc split directory and return a list of (image_path, label, bbox)
+    triples.  Annotations with no matching image file are skipped.
     """
     ann_dir = split_dir / "Annotations"
     img_dir = split_dir / "JPEGImages"
@@ -108,9 +105,8 @@ def scan_voc_split(split_dir: Path) -> List[Tuple[Path, str]]:
     if not img_dir.exists():
         raise FileNotFoundError(f"JPEGImages directory not found: {img_dir}")
 
-    records: List[Tuple[Path, str, "BBox"]] = []
-    skipped    = 0
-    no_bbox    = 0
+    records: List[Tuple[Path, str, BBox]] = []
+    skipped = 0
 
     for xml_file in sorted(ann_dir.glob("*.xml")):
         label, bbox = parse_voc_annotation(xml_file)
@@ -118,7 +114,7 @@ def scan_voc_split(split_dir: Path) -> List[Tuple[Path, str]]:
             skipped += 1
             continue
 
-        stem = xml_file.stem
+        stem     = xml_file.stem
         img_path = None
         for ext in IMAGE_EXTENSIONS:
             candidate = img_dir / (stem + ext)
@@ -127,30 +123,45 @@ def scan_voc_split(split_dir: Path) -> List[Tuple[Path, str]]:
                 break
 
         if img_path is None:
-            print(f"[WARN] No image found for annotation: {xml_file.name}")
+            print(f"[WARNING] No image found for annotation: {xml_file.name}")
             skipped += 1
             continue
 
-        if bbox is None:
-            no_bbox += 1
-
         records.append((img_path, label, bbox))
 
+    n_bbox = sum(1 for _, _, b in records if b is not None)
     print(f"[{split_dir.name}] Loaded {len(records)} samples "
-          f"({skipped} skipped, {no_bbox} without bounding boxes).")
+          f"({skipped} skipped, {n_bbox}/{len(records)} with bounding box).")
     return records
 
+
+
+# Class-balanced stratified split
 def stratified_split(
     records: List[Tuple[Path, str, BBox]],
     val_fraction: float,
     seed: int = SPLIT_SEED,
 ) -> Tuple[List, List]:
     """
-    Split records into (main, val) lists with class-balanced sampling.
+    Split records into (main, val) with class-balanced sampling.
+
+    Each species contributes floor(n * val_fraction) samples to the
+    validation set.  The selection within each class is seeded for
+    reproducibility.
+
+    Parameters
+    ----------
+    records      : list of (image_path, label, bbox) triples
+    val_fraction : fraction of each class to reserve for validation
+    seed         : random seed
+
+    Returns
+    -------
+    main_records : list
+    val_records  : list
     """
     rng = random.Random(seed)
 
-    # Group indices by class label
     class_indices: Dict[str, List[int]] = defaultdict(list)
     for i, (_, label, _) in enumerate(records):
         class_indices[label].append(i)
@@ -169,19 +180,26 @@ def stratified_split(
     val_records  = [records[i] for i in sorted(val_idx)]
     return main_records, val_records
 
+
+
 # PyTorch Dataset
 class WildlifeDataset(Dataset):
     """
     Image-classification dataset built from Pascal VOC annotations.
 
-    Parameters:
-        records   : list of (image_path, raw_label) tuples
-        label2idx : mapping from string label → integer class index
-        transform : torchvision transform applied to each PIL image
+    Each sample is cropped to its bounding box before the transform pipeline
+    is applied, removing domain-sensitive background.
+
+    Parameters
+    ----------
+    records   : list of (image_path, label, bbox) triples
+    label2idx : mapping from species name to integer class index
+    transform : torchvision transform applied after bounding box crop
     """
+
     def __init__(
         self,
-        records: List[Tuple[Path, str, "BBox"]],
+        records: List[Tuple[Path, str, BBox]],
         label2idx: Dict[str, int],
         transform: transforms.Compose,
     ):
@@ -193,25 +211,25 @@ class WildlifeDataset(Dataset):
         return len(self.records)
 
     @staticmethod
-    def _crop_to_bbox(image: Image.Image, bbox: "BBox") -> Image.Image:
+    def _crop_to_bbox(image: Image.Image, bbox: BBox) -> Image.Image:
         """
-        Crop image to the bounding box with padding, clamped to image bounds.
+        Crop the image to the bounding box with fractional padding.
+
+        Padding is BBOX_PAD_FRAC times the shorter side of the box, applied
+        on all four edges and clamped to the image dimensions.
         """
         if bbox is None:
-            return image   # fallback: return full image unchanged
- 
+            return image
+
         xmin, ymin, xmax, ymax = bbox
         w, h = image.size
- 
-        # Compute padding as a fraction of the shorter bbox side
-        pad = int(BBOX_PAD_FRAC * min(xmax - xmin, ymax - ymin))
- 
-        # Expand box by pad, then clamp to image dimensions
+        pad  = int(BBOX_PAD_FRAC * min(xmax - xmin, ymax - ymin))
+
         x0 = max(0, xmin - pad)
         y0 = max(0, ymin - pad)
         x1 = min(w, xmax + pad)
         y1 = min(h, ymax + pad)
- 
+
         return image.crop((x0, y0, x1, y1))
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
@@ -221,63 +239,95 @@ class WildlifeDataset(Dataset):
         image = self.transform(image)
         return image, self.label2idx[label]
 
-# Build datasets and dataloaders
+
+
+# Public API
 def build_datasets(
-    data_root: str = "data",
+    data_root: str = DATA_ROOT,
+    use_data_adapt: bool = False,
 ) -> Tuple["WildlifeDataset", "WildlifeDataset",
-           "WildlifeDataset", "WildlifeDataset",
-           Dict[str, int], Dict[int, str]]:
+           "WildlifeDataset", Dict[str, int], Dict[int, str]]:
     """
-    Scan voc_day and voc_night, apply class-balanced splitting, and return dataset objects.
+    Scan voc_day and voc_night, build datasets according to the split strategy.
+
+    Split ratios
+    ------------
+    voc_day   : 100% training (all records used).
+    voc_night : 80% test, 20% validation (class-balanced, seeded).
+
+    When use_data_adapt is True, a second copy of the full daytime training
+    records is created with night-simulation transforms and concatenated with
+    the original training set.  The combined dataset is returned as train_ds.
+    The adapted transform is imported from data_adaptation.py at call time.
+
+    Parameters
+    ----------
+    data_root      : path to the directory containing voc_day and voc_night
+    use_data_adapt : whether to append night-simulated daytime images to training
+
+    Returns
+    -------
+    train_ds     : WildlifeDataset (or ConcatDataset when adaptation is on)
+    test_ds      : WildlifeDataset  80% of voc_night
+    val_night_ds : WildlifeDataset  20% of voc_night
+    label2idx    : dict mapping species name to integer index
+    idx2label    : dict mapping integer index to species name
     """
     root = Path(data_root)
+
     day_records   = scan_voc_split(root / "voc_day")
     night_records = scan_voc_split(root / "voc_night")
 
-    # Build vocabulary from voc_day only
+    # Build vocabulary from voc_day only so the output head is fully defined
+    # before any test data is seen.
     all_labels = sorted({label for _, label, _ in day_records})
     label2idx  = {lbl: i for i, lbl in enumerate(all_labels)}
     idx2label  = {i: lbl for lbl, i in label2idx.items()}
 
     print(f"\nClasses ({len(all_labels)}): {all_labels}\n")
 
-    # Class-balanced stratified split — voc_day: 90% train / 10% val
-    train_records, val_day_records = stratified_split(
-        day_records, val_fraction=0.10, seed=SPLIT_SEED
-    )
-
-    # Class-balanced stratified split — voc_night: 80% test / 20% val
-    night_records_known = [r for r in night_records if r[1] in label2idx]
+    # voc_night: 80% test / 20% validation (class-balanced)
+    night_known = [r for r in night_records if r[1] in label2idx]
     test_records, val_night_records = stratified_split(
-        night_records_known, val_fraction=0.20, seed=SPLIT_SEED
+        night_known, val_fraction=0.20, seed=SPLIT_SEED
     )
 
-    print(f"  voc_day   : {len(train_records)} train  / {len(val_day_records)} val")
-    print(f"  voc_night : {len(test_records)} test   / {len(val_night_records)} val\n")
+    print(f"  voc_day   : {len(day_records)} training samples (100%)")
+    print(f"  voc_night : {len(test_records)} test / {len(val_night_records)} validation\n")
 
-    train_ds     = WildlifeDataset(train_records,     label2idx, get_train_transforms())
-    val_day_ds   = WildlifeDataset(val_day_records,   label2idx, get_eval_transforms())
+    # Original training dataset with standard augmentation
+    original_train_ds = WildlifeDataset(day_records, label2idx, get_train_transforms())
+
+    if use_data_adapt:
+        # Adapted dataset: same records, night-simulation transform
+        from data_adaptation import get_adapted_train_transforms
+        adapted_train_ds = WildlifeDataset(
+            day_records, label2idx, get_adapted_train_transforms()
+        )
+        # Concatenate original and adapted datasets so the model sees both
+        train_ds = ConcatDataset([original_train_ds, adapted_train_ds])
+        print(f"  Training set: {len(original_train_ds)} original + "
+              f"{len(adapted_train_ds)} adapted = {len(train_ds)} total samples.")
+    else:
+        train_ds = original_train_ds
+        print(f"  Training set: {len(train_ds)} samples (original only).")
+
     test_ds      = WildlifeDataset(test_records,      label2idx, get_eval_transforms())
     val_night_ds = WildlifeDataset(val_night_records, label2idx, get_eval_transforms())
 
-    return train_ds, val_day_ds, test_ds, val_night_ds, label2idx, idx2label
+    return train_ds, test_ds, val_night_ds, label2idx, idx2label
 
 
 def get_dataloaders(
-    train_ds:     "WildlifeDataset",
-    val_day_ds:   "WildlifeDataset",
+    train_ds:     Dataset,
     test_ds:      "WildlifeDataset",
     val_night_ds: "WildlifeDataset",
     batch_size:   int = 16,
     num_workers:  int = 4,
-) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
-    """Return train, val_day, test, and val_night DataLoaders."""
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Return train, test, and val_night DataLoaders."""
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-    )
-    val_day_loader = DataLoader(
-        val_day_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
     )
     test_loader = DataLoader(
@@ -288,26 +338,26 @@ def get_dataloaders(
         val_night_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
     )
-    return train_loader, val_day_loader, test_loader, val_night_loader
+    return train_loader, test_loader, val_night_loader
 
-# Quick self-test
+
+
+# Self-test
 if __name__ == "__main__":
     import sys
 
-    data_root = sys.argv[1] if len(sys.argv) > 1 else "data"
-    train_ds, val_day_ds, test_ds, val_night_ds, label2idx, idx2label = build_datasets(data_root)
+    data_root = sys.argv[1] if len(sys.argv) > 1 else DATA_ROOT
+    train_ds, test_ds, val_night_ds, label2idx, idx2label = \
+        build_datasets(data_root, use_data_adapt=False)
 
-    print(f"Train samples : {len(train_ds)}")
-    print(f"Val (day) samples : {len(val_day_ds)}")
-    print(f"Test samples  : {len(test_ds)}")
-    print(f"Val (night) samples : {len(val_night_ds)}")
-    print(f"Num classes   : {len(label2idx)}")
+    print(f"Train      : {len(train_ds)}")
+    print(f"Test       : {len(test_ds)}")
+    print(f"Val night  : {len(val_night_ds)}")
+    print(f"Num classes: {len(label2idx)}")
 
-    # One batch check
-    train_loader, val_day_loader, test_loader, val_night_loader = get_dataloaders(
-        train_ds, val_day_ds, test_ds, val_night_ds, batch_size=4, num_workers=0
+    train_loader, _, _ = get_dataloaders(
+        train_ds, test_ds, val_night_ds, batch_size=4, num_workers=0
     )
     imgs, labels = next(iter(train_loader))
-    print(f"Batch shape   : {imgs.shape}")
-    print(f"Label indices : {labels.tolist()}")
-    print(f"Label names   : {[idx2label[i.item()] for i in labels]}")
+    print(f"Batch shape : {imgs.shape}")
+    print(f"Labels      : {[idx2label[i.item()] for i in labels]}")
