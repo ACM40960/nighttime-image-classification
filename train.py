@@ -1,3 +1,72 @@
+"""
+train.py
+--------
+Fine-tunes facebook/dinov2-base (ViT-B/14) as an image classifier on the
+daytime camera-trap images (voc_day) and validates on a held-out 20% subset
+of the nighttime images (voc_night).
+
+Split strategy
+--------------
+  voc_day   : 100% training.
+  voc_night : 80% test (evaluated after training), 20% validation (tracked
+              per epoch to select the best checkpoint).
+
+When data adaptation is active (--use_data_adapt), the training set consists
+of 100% original daytime images concatenated with 100% night-simulated copies
+of the same images, doubling the effective training set size.
+
+Training schedule
+-----------------
+Without --use_supcon (baseline):
+
+  Phase 1 - Warmup (all warmup_epochs, backbone fully frozen).
+    Only the classification head is trained with cross-entropy loss.
+    Freezing the backbone protects the pretrained weights from the large
+    gradients produced by a randomly-initialised classification head.
+
+  Phase 2 - Partial fine-tune (remaining epochs, last N blocks unfrozen).
+    The last finetune_blocks encoder blocks and the final layer norm are
+    unfrozen and updated at backbone_lr = lr * 0.02.  All earlier backbone
+    layers remain frozen.
+
+With --use_supcon:
+
+  Phase 1a - Projection head stabilisation (first 5 of warmup_epochs,
+             backbone fully frozen).
+    The projection head (Linear -> ReLU -> Linear -> L2-norm) is trained
+    with Supervised Contrastive Loss while the backbone remains frozen.
+    This mirrors the non-SupCon Phase 1 logic: the randomly-initialised
+    projection head is allowed to stabilise before any backbone weights
+    are touched, preventing noisy early gradients from corrupting the
+    pretrained representations.
+
+  Phase 1b - Contrastive backbone shaping (remaining warmup_epochs,
+             backbone fully unfrozen at lr * 0.02).
+    With the projection head now producing meaningful embeddings, the
+    backbone is unfrozen at a small learning rate so the contrastive
+    objective can shape its representations toward species-discriminative,
+    domain-robust features.  The projection head continues training at lr.
+
+  Phase 2 - Partial fine-tune (remaining epochs, last N blocks unfrozen).
+    Identical to the non-SupCon Phase 2.  The backbone is re-frozen, then
+    the last finetune_blocks blocks are unfrozen at lr * 0.02.  The
+    projection head is discarded; the classification head is trained with
+    cross-entropy.
+
+Epoch allocation for SupCon (example with --warmup_epochs 10 --epochs 20):
+  Phase 1a : epochs 1-5   (backbone frozen, proj head, SupCon loss)
+  Phase 1b : epochs 6-10  (backbone unfrozen at lr*0.02, SupCon loss)
+  Phase 2  : epochs 11-20 (last N blocks unfrozen at lr*0.02, CE loss)
+
+If warmup_epochs <= 5 and SupCon is active, Phase 1b has zero epochs and
+the schedule collapses to: Phase 1a (all warmup_epochs) then Phase 2.
+
+Checkpointing
+-------------
+  Best checkpoint (by val_night macro-F1) : output_dir/best_model_{ts}.pt
+  Per-epoch training log                  : output_dir/train_log_{ts}.csv
+"""
+
 import argparse
 import csv
 import json
@@ -15,8 +84,10 @@ from transformers import Dinov2Model
 from dataset import build_datasets, get_dataloaders
 
 
-
+# 
 # Model
+# 
+
 class Dinov2Classifier(nn.Module):
     """
     DINOv2-base backbone with a linear classification head and an optional
@@ -38,7 +109,7 @@ class Dinov2Classifier(nn.Module):
 
     With SupCon:
       Phase 1a : fully frozen (projection head stabilisation).
-      Phase 1b : fully unfrozen at lr * 0.01 (contrastive backbone shaping).
+      Phase 1b : fully unfrozen at lr * 0.02 (contrastive backbone shaping).
       Phase 2  : re-frozen, then last finetune_blocks blocks unfrozen at lr * 0.02.
     """
 
@@ -139,7 +210,7 @@ class SupConLoss(nn.Module):
         original paper.
     """
 
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self, temperature: float = 0.05):
         super().__init__()
         self.temperature = temperature
 
@@ -362,7 +433,7 @@ def train(args):
 
     # Loss functions.
     ce_criterion     = nn.CrossEntropyLoss(label_smoothing=0.1)
-    supcon_criterion = SupConLoss(temperature=0.07)
+    supcon_criterion = SupConLoss(temperature=0.05)
 
     # Initial optimiser for epoch 1.
     # Without SupCon: backbone frozen, classification head only.
@@ -414,7 +485,7 @@ def train(args):
               f"phase 1: {args.warmup_epochs}, "
               f"phase 2: {args.epochs - args.warmup_epochs})")
     print(f"  LR       : {args.lr}  "
-          f"(backbone phase 1b: {args.lr * 0.01}, phase 2: {args.lr * 0.02})")
+          f"(backbone phase 1b: {args.lr * 0.02}, phase 2: {args.lr * 0.05})")
     print(f"  Batch    : {args.batch_size}")
     adapt_parts = []
     if use_data_adapt:
@@ -447,7 +518,7 @@ def train(args):
                 head_params     = list(model.head.parameters())
                 optimizer = AdamW(
                     [
-                        {"params": backbone_params, "lr": args.lr * 0.02},
+                        {"params": backbone_params, "lr": args.lr * 0.05},
                         {"params": head_params,     "lr": args.lr},
                     ],
                     weight_decay=1e-4,
@@ -466,7 +537,7 @@ def train(args):
                 # Unfreeze full backbone at a small LR; projection head at full LR.
                 tqdm.write(
                     f"\nPhase 1b: backbone fully unfrozen for contrastive shaping "
-                    f"(backbone LR = {args.lr * 0.01})."
+                    f"(backbone LR = {args.lr * 0.02})."
                 )
                 model.unfreeze_backbone()
                 backbone_params = list(model.backbone.parameters())
@@ -474,7 +545,7 @@ def train(args):
                 # Classification head still excluded — not trained until Phase 2.
                 optimizer = AdamW(
                     [
-                        {"params": backbone_params, "lr": args.lr * 0.01},
+                        {"params": backbone_params, "lr": args.lr * 0.02},
                         {"params": proj_params,     "lr": args.lr},
                     ],
                     weight_decay=1e-4,
@@ -500,7 +571,7 @@ def train(args):
                 head_params = list(model.head.parameters())
                 optimizer = AdamW(
                     [
-                        {"params": backbone_params, "lr": args.lr * 0.02},
+                        {"params": backbone_params, "lr": args.lr * 0.05},
                         {"params": head_params,     "lr": args.lr},
                     ],
                     weight_decay=1e-4,
@@ -603,7 +674,7 @@ def parse_args():
     p.add_argument("--data_root",       default="./data")
     p.add_argument("--output_dir",      default="./outputs")
     p.add_argument("--run_ts",          default="run")
-    p.add_argument("--epochs",          type=int,   default=50)
+    p.add_argument("--epochs",          type=int,   default=30)
     p.add_argument("--warmup_epochs",   type=int,   default=15)
     p.add_argument("--finetune_blocks", type=int,   default=3,
                    help="Number of trailing encoder blocks to unfreeze in Phase 2.")

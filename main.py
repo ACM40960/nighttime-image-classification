@@ -5,20 +5,18 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from dataset import build_datasets, get_dataloaders
-from train import train, Dinov2Classifier
+from dataset import build_datasets
+from train import train
 import evaluate as eval_module
-
 
 
 # Fixed output path and default data root
 DATA_ROOT  = "./data"
 OUTPUT_DIR = "./outputs"
 
-
 # Default configuration
 CONFIG = dict(
-    epochs          = 50,
+    epochs          = 30,
     warmup_epochs   = 15,
     finetune_blocks = 3,
     batch_size      = 64,
@@ -29,14 +27,12 @@ CONFIG = dict(
 )
 
 
-
 # Utilities
 def banner(title: str, width: int = 60):
     print(f"\n{'=' * width}")
     pad = (width - len(title) - 2) // 2
     print(f"{'=' * pad} {title} {'=' * (width - pad - len(title) - 2)}")
     print(f"{'=' * width}\n")
-
 
 
 # Step 1 - Verify
@@ -65,7 +61,6 @@ def step_verify(cfg) -> tuple:
     return train_ds, test_ds, val_night_ds, label2idx, idx2label
 
 
-
 # Step 2 - Train
 def step_train(cfg):
     """Run the two-phase training loop and save the best checkpoint."""
@@ -73,7 +68,7 @@ def step_train(cfg):
 
     options = []
     if cfg.use_data_adapt:
-        options.append("data adaptation (medium)")
+        options.append("data adaptation")
     if cfg.use_supcon:
         options.append("supervised contrastive loss")
     if options:
@@ -94,7 +89,6 @@ def step_train(cfg):
     mins, secs = divmod(int(elapsed), 60)
     print(f"\n  Training complete in {mins}m {secs}s.")
     print(f"  Checkpoint : {checkpoint}")
-
 
 
 # Step 3 - Evaluate
@@ -123,7 +117,6 @@ def step_evaluate(cfg):
     print(f"    pr_auc_{ts}.png")
 
 
-
 # Summary
 def print_summary(cfg, total_elapsed: float):
     banner("PIPELINE COMPLETE", width=60)
@@ -149,7 +142,7 @@ def parse_args():
     p.add_argument("--batch_size",      type=int,   default=CONFIG["batch_size"],
                    help="Training and evaluation batch size.")
     p.add_argument("--lr",              type=float, default=CONFIG["lr"],
-                   help="Head learning rate. Backbone uses lr * 0.02 in Phase 2.")
+                   help="Head learning rate. Backbone uses lr * 0.05 in Phase 2.")
     p.add_argument("--num_workers",     type=int,   default=CONFIG["num_workers"],
                    help="DataLoader worker processes.")
     p.add_argument("--use_data_adapt",  action="store_true",
@@ -180,7 +173,7 @@ def main():
     print(f"  Epochs         : {cfg.epochs} "
           f"(warmup: {cfg.warmup_epochs}, finetune blocks: {cfg.finetune_blocks})")
     print(f"  Batch size     : {cfg.batch_size}")
-    print(f"  Learning rate  : {cfg.lr} (backbone: {cfg.lr * 0.02})")
+    print(f"  Learning rate  : {cfg.lr} (backbone: {cfg.lr * 0.05})")
     print(f"  Workers        : {cfg.num_workers}")
     print(f"  Data adapt     : {'on' if cfg.use_data_adapt else 'off'}")
     print(f"  SupCon         : {'on' if cfg.use_supcon else 'off'}")
