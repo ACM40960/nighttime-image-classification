@@ -310,52 +310,48 @@ def build_datasets(
 
     return train_ds, test_ds, val_night_ds, label2idx, idx2label
 
-# PK Sampler
-class PKSampler(torch.utils.data.Sampler):
+
+
+# Minimum-K batch sampler
+class MinKBatchSampler(torch.utils.data.BatchSampler):
     """
-    PK (class-P, samples-K) batch sampler for metric learning.
+    Batch sampler that guarantees every species appearing in a batch is
+    represented by at least MIN_K = 4 samples.
 
-    Each batch is constructed by:
-      1. Sampling P species uniformly at random (without replacement per batch,
-         with replacement across batches so all species are seen over an epoch).
-      2. Sampling K images per selected species (with replacement when a species
-         has fewer than K samples in the dataset).
+    Strategy per batch
+    ------------------
+    1. Draw batch_size indices from a shuffled epoch-level list so every sample
+       is seen approximately once per epoch.
+    2. For each species in the draft batch with fewer than MIN_K samples, pull
+       additional indices for that species (with replacement from its pool) and
+       replace slots belonging to species that already exceed MIN_K.
 
-    This guarantees every batch contains at least K positives per species, which
-    is the minimum required by Supervised Contrastive Loss to form meaningful
-    positive pairs for all anchors.
+    batch_size is respected exactly.  Species with fewer than MIN_K total
+    training samples are filled with replacement from their available pool.
 
-    Fixed constants (not exposed as arguments):
-      P = 12  (species per batch)
-      K = 3   (samples per species per batch)
-
-    Effective batch size = P * K = 36 per iteration.
+    MIN_K is fixed at 3 and is not exposed as a CLI argument.
 
     Parameters
     ----------
     dataset    : WildlifeDataset or ConcatDataset used for training.
     label2idx  : species name to integer index mapping.
-    num_batches: number of batches per epoch.  Defaults to
-                 ceil(len(dataset) / (P * K)) so one epoch sees approximately
-                 the same number of samples as standard random sampling.
-    seed       : random seed for reproducibility.
+    batch_size : number of samples per batch.
+    seed       : random seed for epoch-level shuffle.
     """
 
-    P = 12
-    K = 6
+    MIN_K = 4
 
     def __init__(
         self,
         dataset,
         label2idx: Dict[str, int],
-        num_batches: Optional[int] = None,
+        batch_size: int,
         seed: int = SPLIT_SEED,
     ):
-        self.label2idx   = label2idx
-        self.num_classes = len(label2idx)
-        self.seed        = seed
+        self.batch_size = batch_size
+        self.seed       = seed
 
-        # Build index lists grouped by class.
+        # Build per-class index pools.
         self.class_indices: Dict[int, List[int]] = defaultdict(list)
         if isinstance(dataset, ConcatDataset):
             offset = 0
@@ -367,103 +363,66 @@ class PKSampler(torch.utils.data.Sampler):
             for idx, (_, label, _) in enumerate(dataset.records):
                 self.class_indices[label2idx[label]].append(idx)
 
-        batch_size = self.P * self.K
-        self.num_batches = (
-            num_batches if num_batches is not None
-            else max(1, (len(dataset) + batch_size - 1) // batch_size)
-        )
+        # Flat list of all indices for the epoch-level shuffle.
+        self.all_indices = [
+            idx
+            for indices in self.class_indices.values()
+            for idx in indices
+        ]
+        self._n_batches = max(1, len(self.all_indices) // batch_size)
+
+        # Reverse map: dataset index -> class id for fast label lookup.
+        self.idx_to_class: Dict[int, int] = {}
+        for cls, indices in self.class_indices.items():
+            for idx in indices:
+                self.idx_to_class[idx] = cls
 
     def __len__(self) -> int:
-        return self.num_batches * self.P * self.K
+        return self._n_batches
 
     def __iter__(self):
         rng = random.Random(self.seed)
-        available_classes = sorted(self.class_indices.keys())
 
-        for _ in range(self.num_batches):
-            # Sample P classes (with replacement if fewer than P classes exist).
-            if len(available_classes) >= self.P:
-                chosen_classes = rng.sample(available_classes, self.P)
-            else:
-                chosen_classes = [
-                    rng.choice(available_classes) for _ in range(self.P)
+        shuffled = self.all_indices[:]
+        rng.shuffle(shuffled)
+
+        # Pad to fill the last batch if needed.
+        total_needed = self._n_batches * self.batch_size
+        while len(shuffled) < total_needed:
+            extra = self.all_indices[:]
+            rng.shuffle(extra)
+            shuffled.extend(extra)
+        shuffled = shuffled[:total_needed]
+
+        for batch_start in range(0, total_needed, self.batch_size):
+            batch = list(shuffled[batch_start: batch_start + self.batch_size])
+
+            # Count occurrences per class in the draft batch.
+            class_counts: Dict[int, int] = defaultdict(int)
+            for idx in batch:
+                class_counts[self.idx_to_class[idx]] += 1
+
+            # Enforce MIN_K for every species present in this batch.
+            for cls, count in list(class_counts.items()):
+                deficit = self.MIN_K - count
+                if deficit <= 0:
+                    continue
+
+                # Find replaceable slots: species already above MIN_K.
+                replaceable = [
+                    i for i, idx in enumerate(batch)
+                    if class_counts[self.idx_to_class[idx]] > self.MIN_K
                 ]
 
-            batch_indices = []
-            for cls in chosen_classes:
-                indices = self.class_indices[cls]
-                if len(indices) >= self.K:
-                    chosen = rng.sample(indices, self.K)
-                else:
-                    # Sample with replacement when fewer than K samples exist.
-                    chosen = [rng.choice(indices) for _ in range(self.K)]
-                batch_indices.extend(chosen)
+                pool = self.class_indices[cls]
+                for _ in range(min(deficit, len(replaceable))):
+                    new_idx = rng.choice(pool)
+                    slot    = replaceable.pop(rng.randrange(len(replaceable)))
+                    class_counts[self.idx_to_class[batch[slot]]] -= 1
+                    batch[slot] = new_idx
+                    class_counts[cls] += 1
 
-            yield from batch_indices
-
-
-# Dual-view dataset wrapper
-class DualViewDataset(Dataset):
-    """
-    Wraps a WildlifeDataset (or ConcatDataset) to produce two independently
-    augmented views of each image per call to __getitem__.
-
-    This guarantees that for every sample in a batch, its augmented counterpart
-    is also present in the same batch as a confirmed positive pair, satisfying
-    the requirement of Supervised Contrastive Loss without relying on random
-    chance to produce positives.
-
-    The two views are produced by applying the dataset's existing stochastic
-    transform twice independently.  Both are returned as a single stacked
-    tensor of shape (2, C, H, W) alongside the integer label.
-
-    When the underlying dataset is a ConcatDataset, __getitem__ dispatches
-    to the correct sub-dataset transparently.
-
-    This wrapper is applied only during SupCon training phases (1a and 1b).
-    During Phase 2 and evaluation the original dataset is used directly.
-
-    Parameters
-    ----------
-    dataset : WildlifeDataset or ConcatDataset.
-    """
-
-    def __init__(self, dataset: Dataset):
-        self.dataset = dataset
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        """
-        Returns
-        -------
-        views  : (2, C, H, W) stacked tensor of two augmented views.
-        label  : integer class index.
-        """
-        if isinstance(self.dataset, ConcatDataset):
-            # Locate which sub-dataset owns this index.
-            cumulative = 0
-            for ds in self.dataset.datasets:
-                if idx < cumulative + len(ds):
-                    img_path, label_str, bbox = ds.records[idx - cumulative]
-                    transform = ds.transform
-                    label_int = ds.label2idx[label_str]
-                    break
-                cumulative += len(ds)
-        else:
-            img_path, label_str, bbox = self.dataset.records[idx]
-            transform = self.dataset.transform
-            label_int = self.dataset.label2idx[label_str]
-
-        image = Image.open(img_path).convert("RGB")
-        image = WildlifeDataset._crop_to_bbox(image, bbox)
-
-        view1 = transform(image)
-        view2 = transform(image)
-
-        return torch.stack([view1, view2], dim=0), label_int
-
+            yield batch
 
 
 # Class weight computation
@@ -471,19 +430,28 @@ def get_class_weights(
     dataset: Dataset,
     label2idx: Dict[str, int],
     device: "torch.device",
+    max_weight: float = 3.0,
 ) -> "torch.Tensor":
     """
     Compute per-class weights for weighted cross-entropy loss.
 
-    Returns a tensor of shape (num_classes,) where each entry is inversely
-    proportional to the class frequency in the training dataset, normalised
-    so the mean weight is 1.0.
+    Each weight is inversely square-root proportional to the class frequency in the
+    training dataset, normalised so the mean weight is 1.0, then capped at
+    max_weight to prevent severely underrepresented classes (e.g. species with
+    fewer than 50 training samples) from producing disproportionately large
+    loss signals that cause the model to collapse toward predicting that class.
+
+    Without the cap, a class with 5-50 samples in a 15,000-sample dataset
+    receives a weight 10-50x higher than the median class, overwhelming the
+    gradient signal from all other species.
 
     Parameters
     ----------
-    dataset   : the training Dataset or ConcatDataset.
-    label2idx : species name to integer index mapping.
-    device    : torch device to place the weight tensor on.
+    dataset    : training Dataset or ConcatDataset.
+    label2idx  : species name to integer index mapping.
+    device     : torch device.
+    max_weight : maximum allowed weight after normalisation.  Default 3.0
+                 means no class receives more than 2x the average loss weight.
 
     Returns
     -------
@@ -502,9 +470,22 @@ def get_class_weights(
 
     weights = 1.0 / counts.clamp(min=1)
     weights = weights / weights.mean()
+    weights = weights.clamp(max=max_weight)   # cap extreme amplification
+
+    # override weights for rare species
+    override_multiplier = 2.0
+    override_species = ["RaccoonDog", "Sable", "MuskDeer"]
+    for species in override_species:
+        if species in label2idx:
+            idx = label2idx[species]
+            weights[idx] = min(weights[idx] * override_multiplier, max_weight)
+        else:
+            print(f"[WARNING] Override species not found in label2idx: {species}")
     return weights.to(device)
 
+
 # DataLoaders
+
 def get_dataloaders(
     train_ds:     Dataset,
     test_ds:      "WildlifeDataset",
@@ -520,25 +501,24 @@ def get_dataloaders(
     Training loader strategy
     ------------------------
     When use_supcon is True:
-      - The training dataset is wrapped in DualViewDataset so each sample
-        produces two independently augmented views.  The batch collation then
-        yields tensors of shape (B, 2, C, H, W) and labels of shape (B,).
-      - A PKSampler (P=12 species, K=3 samples per species) controls index
-        selection, guaranteeing at least K positives per species in every batch.
-      - The effective batch size is P * K = 36 regardless of --batch_size.
+      - MinKBatchSampler ensures every species in a batch appears at least
+        MIN_K = 3 times.  batch_size is respected exactly.
+      - When use_data_adapt is also active, the training set is a ConcatDataset
+        of original and night-simulated copies of every daytime image.  Sample
+        index i in the original half and index i+N in the adapted half are
+        guaranteed positive pairs by construction (same image, different
+        transform), providing implicit dual-view positives without any wrapper.
 
     When use_supcon is False:
-      - The training dataset is used directly with shuffle=True.
-      - batch_size from args is used.
+      - Standard DataLoader with shuffle=True and the given batch_size.
 
     Test and validation loaders always use shuffle=False with no special sampler.
     """
     if use_supcon:
-        dual_train_ds = DualViewDataset(train_ds)
-        pk_sampler    = PKSampler(train_ds, label2idx)
+        min_k_sampler = MinKBatchSampler(train_ds, label2idx, batch_size)
         train_loader  = DataLoader(
-            dual_train_ds,
-            batch_sampler = _PKBatchSampler(pk_sampler),
+            train_ds,
+            batch_sampler = min_k_sampler,
             num_workers   = num_workers,
             pin_memory    = True,
         )
@@ -557,32 +537,6 @@ def get_dataloaders(
         num_workers=num_workers, pin_memory=True,
     )
     return train_loader, test_loader, val_night_loader
-
-
-class _PKBatchSampler(torch.utils.data.BatchSampler):
-    """
-    Thin adapter that converts PKSampler's flat index stream into batches of
-    size P * K for use as batch_sampler in DataLoader.
-
-    PyTorch's DataLoader requires either (sampler + batch_size) or
-    batch_sampler.  PKSampler already yields complete batches implicitly
-    (P*K indices per iteration), so this adapter groups them correctly.
-    """
-
-    def __init__(self, pk_sampler: PKSampler):
-        self.pk_sampler = pk_sampler
-        self.batch_size = pk_sampler.P * pk_sampler.K
-
-    def __len__(self) -> int:
-        return self.pk_sampler.num_batches
-
-    def __iter__(self):
-        batch = []
-        for idx in self.pk_sampler:
-            batch.append(idx)
-            if len(batch) == self.batch_size:
-                yield batch
-                batch = []
 
 
 # Self-test

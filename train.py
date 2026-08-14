@@ -230,23 +230,16 @@ def train_one_epoch(
     desc = f"  Train E{epoch:>2}/{total_epochs} [phase {sub_phase}]"
     with tqdm(loader, desc=desc, leave=False, unit="batch",
               bar_format="{l_bar}{bar:25}{r_bar}") as pbar:
-        for batch_data, labels in pbar:
-            labels = labels.to(device)
+        for imgs, labels in pbar:
+            imgs, labels = imgs.to(device), labels.to(device)
 
             optimizer.zero_grad()
 
             if use_supcon_active:
-                # batch_data: (B, 2, C, H, W)
-                B, two, C, H, W = batch_data.shape
-                # Flatten views into (2B, C, H, W) for a single forward pass.
-                views = batch_data.view(B * two, C, H, W).to(device)
-                # Repeat labels: [l0, l0, l1, l1, ...] shape (2B,)
-                labels_rep = labels.repeat_interleave(two)
-                embeddings = model(views, return_projection=True)  # (2B, D)
-                loss       = criterion(embeddings, labels_rep)
-                batch_n    = B
+                embeddings = model(imgs, return_projection=True)
+                loss       = criterion(embeddings, labels)
+                batch_n    = imgs.size(0)
             else:
-                imgs    = batch_data.to(device)
                 logits  = model(imgs)
                 loss    = criterion(logits, labels)
                 batch_n = imgs.size(0)
@@ -335,11 +328,7 @@ def evaluate(
 
 # Main training loop
 def train(args):
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else
-        "mps"  if torch.backends.mps.is_available() else
-        "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     use_data_adapt  = getattr(args, "use_data_adapt",  False)
@@ -621,7 +610,6 @@ def train(args):
 
 
 # Entry point
-
 def parse_args():
     p = argparse.ArgumentParser(
         description="Train DINOv2-base on camera-trap images."
@@ -633,7 +621,7 @@ def parse_args():
     p.add_argument("--warmup_epochs",   type=int,   default=15)
     p.add_argument("--finetune_blocks", type=int,   default=3,
                    help="Number of trailing encoder blocks to unfreeze in Phase 2.")
-    p.add_argument("--batch_size",      type=int,   default=72)
+    p.add_argument("--batch_size",      type=int,   default=76)
     p.add_argument("--lr",              type=float, default=1e-4)
     p.add_argument("--num_workers",     type=int,   default=4)
     p.add_argument("--use_data_adapt",  action="store_true",
