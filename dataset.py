@@ -402,6 +402,108 @@ class PKSampler(torch.utils.data.Sampler):
             yield from batch_indices
 
 
+# Dual-view dataset wrapper
+class DualViewDataset(Dataset):
+    """
+    Wraps a WildlifeDataset (or ConcatDataset) to produce two independently
+    augmented views of each image per call to __getitem__.
+
+    This guarantees that for every sample in a batch, its augmented counterpart
+    is also present in the same batch as a confirmed positive pair, satisfying
+    the requirement of Supervised Contrastive Loss without relying on random
+    chance to produce positives.
+
+    The two views are produced by applying the dataset's existing stochastic
+    transform twice independently.  Both are returned as a single stacked
+    tensor of shape (2, C, H, W) alongside the integer label.
+
+    When the underlying dataset is a ConcatDataset, __getitem__ dispatches
+    to the correct sub-dataset transparently.
+
+    This wrapper is applied only during SupCon training phases (1a and 1b).
+    During Phase 2 and evaluation the original dataset is used directly.
+
+    Parameters
+    ----------
+    dataset : WildlifeDataset or ConcatDataset.
+    """
+
+    def __init__(self, dataset: Dataset):
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        """
+        Returns
+        -------
+        views  : (2, C, H, W) stacked tensor of two augmented views.
+        label  : integer class index.
+        """
+        if isinstance(self.dataset, ConcatDataset):
+            # Locate which sub-dataset owns this index.
+            cumulative = 0
+            for ds in self.dataset.datasets:
+                if idx < cumulative + len(ds):
+                    img_path, label_str, bbox = ds.records[idx - cumulative]
+                    transform = ds.transform
+                    label_int = ds.label2idx[label_str]
+                    break
+                cumulative += len(ds)
+        else:
+            img_path, label_str, bbox = self.dataset.records[idx]
+            transform = self.dataset.transform
+            label_int = self.dataset.label2idx[label_str]
+
+        image = Image.open(img_path).convert("RGB")
+        image = WildlifeDataset._crop_to_bbox(image, bbox)
+
+        view1 = transform(image)
+        view2 = transform(image)
+
+        return torch.stack([view1, view2], dim=0), label_int
+
+
+
+# Class weight computation
+def get_class_weights(
+    dataset: Dataset,
+    label2idx: Dict[str, int],
+    device: "torch.device",
+) -> "torch.Tensor":
+    """
+    Compute per-class weights for weighted cross-entropy loss.
+
+    Returns a tensor of shape (num_classes,) where each entry is inversely
+    proportional to the class frequency in the training dataset, normalised
+    so the mean weight is 1.0.
+
+    Parameters
+    ----------
+    dataset   : the training Dataset or ConcatDataset.
+    label2idx : species name to integer index mapping.
+    device    : torch device to place the weight tensor on.
+
+    Returns
+    -------
+    weights : torch.Tensor of shape (num_classes,).
+    """
+    num_classes = len(label2idx)
+    counts      = torch.zeros(num_classes, dtype=torch.float)
+
+    if isinstance(dataset, ConcatDataset):
+        for ds in dataset.datasets:
+            for _, label, _ in ds.records:
+                counts[label2idx[label]] += 1
+    else:
+        for _, label, _ in dataset.records:
+            counts[label2idx[label]] += 1
+
+    weights = 1.0 / counts.clamp(min=1)
+    weights = weights / weights.mean()
+    return weights.to(device)
+
 # DataLoaders
 def get_dataloaders(
     train_ds:     Dataset,
@@ -421,7 +523,7 @@ def get_dataloaders(
       - The training dataset is wrapped in DualViewDataset so each sample
         produces two independently augmented views.  The batch collation then
         yields tensors of shape (B, 2, C, H, W) and labels of shape (B,).
-      - A PKSampler (P=10 species, K=3 samples per species) controls index
+      - A PKSampler (P=12 species, K=3 samples per species) controls index
         selection, guaranteeing at least K positives per species in every batch.
       - The effective batch size is P * K = 36 regardless of --batch_size.
 
@@ -432,9 +534,10 @@ def get_dataloaders(
     Test and validation loaders always use shuffle=False with no special sampler.
     """
     if use_supcon:
+        dual_train_ds = DualViewDataset(train_ds)
         pk_sampler    = PKSampler(train_ds, label2idx)
         train_loader  = DataLoader(
-            train_ds,
+            dual_train_ds,
             batch_sampler = _PKBatchSampler(pk_sampler),
             num_workers   = num_workers,
             pin_memory    = True,

@@ -1,72 +1,3 @@
-"""
-train.py
---------
-Fine-tunes facebook/dinov2-base (ViT-B/14) as an image classifier on the
-daytime camera-trap images (voc_day) and validates on a held-out 20% subset
-of the nighttime images (voc_night).
-
-Split strategy
---------------
-  voc_day   : 100% training.
-  voc_night : 80% test (evaluated after training), 20% validation (tracked
-              per epoch to select the best checkpoint).
-
-When data adaptation is active (--use_data_adapt), the training set consists
-of 100% original daytime images concatenated with 100% night-simulated copies
-of the same images, doubling the effective training set size.
-
-Training schedule
------------------
-Without --use_supcon (baseline):
-
-  Phase 1 - Warmup (all warmup_epochs, backbone fully frozen).
-    Only the classification head is trained with cross-entropy loss.
-    Freezing the backbone protects the pretrained weights from the large
-    gradients produced by a randomly-initialised classification head.
-
-  Phase 2 - Partial fine-tune (remaining epochs, last N blocks unfrozen).
-    The last finetune_blocks encoder blocks and the final layer norm are
-    unfrozen and updated at backbone_lr = lr * 0.02.  All earlier backbone
-    layers remain frozen.
-
-With --use_supcon:
-
-  Phase 1a - Projection head stabilisation (first 5 of warmup_epochs,
-             backbone fully frozen).
-    The projection head (Linear -> ReLU -> Linear -> L2-norm) is trained
-    with Supervised Contrastive Loss while the backbone remains frozen.
-    This mirrors the non-SupCon Phase 1 logic: the randomly-initialised
-    projection head is allowed to stabilise before any backbone weights
-    are touched, preventing noisy early gradients from corrupting the
-    pretrained representations.
-
-  Phase 1b - Contrastive backbone shaping (remaining warmup_epochs,
-             backbone fully unfrozen at lr * 0.02).
-    With the projection head now producing meaningful embeddings, the
-    backbone is unfrozen at a small learning rate so the contrastive
-    objective can shape its representations toward species-discriminative,
-    domain-robust features.  The projection head continues training at lr.
-
-  Phase 2 - Partial fine-tune (remaining epochs, last N blocks unfrozen).
-    Identical to the non-SupCon Phase 2.  The backbone is re-frozen, then
-    the last finetune_blocks blocks are unfrozen at lr * 0.02.  The
-    projection head is discarded; the classification head is trained with
-    cross-entropy.
-
-Epoch allocation for SupCon (example with --warmup_epochs 10 --epochs 20):
-  Phase 1a : epochs 1-5   (backbone frozen, proj head, SupCon loss)
-  Phase 1b : epochs 6-10  (backbone unfrozen at lr*0.02, SupCon loss)
-  Phase 2  : epochs 11-20 (last N blocks unfrozen at lr*0.02, CE loss)
-
-If warmup_epochs <= 5 and SupCon is active, Phase 1b has zero epochs and
-the schedule collapses to: Phase 1a (all warmup_epochs) then Phase 2.
-
-Checkpointing
--------------
-  Best checkpoint (by val_night macro-F1) : output_dir/best_model_{ts}.pt
-  Per-epoch training log                  : output_dir/train_log_{ts}.csv
-"""
-
 import argparse
 import csv
 import json
@@ -84,10 +15,7 @@ from transformers import Dinov2Model
 from dataset import build_datasets, get_dataloaders
 
 
-# 
 # Model
-# 
-
 class Dinov2Classifier(nn.Module):
     """
     DINOv2-base backbone with a linear classification head and an optional
@@ -110,7 +38,7 @@ class Dinov2Classifier(nn.Module):
     With SupCon:
       Phase 1a : fully frozen (projection head stabilisation).
       Phase 1b : fully unfrozen at lr * 0.02 (contrastive backbone shaping).
-      Phase 2  : re-frozen, then last finetune_blocks blocks unfrozen at lr * 0.02.
+      Phase 2  : re-frozen, then last finetune_blocks blocks unfrozen at lr * 0.05.
     """
 
     BACKBONE_ID = "facebook/dinov2-base"
@@ -210,7 +138,7 @@ class SupConLoss(nn.Module):
         original paper.
     """
 
-    def __init__(self, temperature: float = 0.05):
+    def __init__(self, temperature: float = 0.07):
         super().__init__()
         self.temperature = temperature
 
@@ -272,13 +200,23 @@ def train_one_epoch(
     """
     Run one full pass over the training DataLoader.
 
+    Batch format
+    ------------
+    When use_supcon_active is True the loader yields (views, labels) where
+    views has shape (B, 2, C, H, W) — two independently augmented views of
+    each image produced by DualViewDataset.  Both views are forwarded through
+    the projection head and concatenated into a (2B, D) embedding tensor.
+    Labels are correspondingly repeated to (2B,) so each view is associated
+    with the correct species class.  The SupConLoss then has guaranteed
+    positive pairs: view1[i] and view2[i] share the same label.
+
+    When use_supcon_active is False the loader yields standard (imgs, labels)
+    tensors and the classification head is used with cross-entropy.
+
     Parameters
     ----------
-    sub_phase        : string label describing the current sub-phase, used in
-                       the tqdm progress bar (e.g. "1a", "1b", "2").
-    use_supcon_active: whether SupCon loss and the projection head are active
-                       for this epoch.  When False, the classification head and
-                       cross-entropy are used.
+    sub_phase        : string label for the tqdm bar (e.g. "1a", "1b", "2").
+    use_supcon_active: whether SupCon loss and dual-view are active this epoch.
 
     Returns
     -------
@@ -292,23 +230,31 @@ def train_one_epoch(
     desc = f"  Train E{epoch:>2}/{total_epochs} [phase {sub_phase}]"
     with tqdm(loader, desc=desc, leave=False, unit="batch",
               bar_format="{l_bar}{bar:25}{r_bar}") as pbar:
-        for imgs, labels in pbar:
-            imgs, labels = imgs.to(device), labels.to(device)
+        for batch_data, labels in pbar:
+            labels = labels.to(device)
 
             optimizer.zero_grad()
 
             if use_supcon_active:
-                embeddings = model(imgs, return_projection=True)
-                loss       = criterion(embeddings, labels)
+                # batch_data: (B, 2, C, H, W)
+                B, two, C, H, W = batch_data.shape
+                # Flatten views into (2B, C, H, W) for a single forward pass.
+                views = batch_data.view(B * two, C, H, W).to(device)
+                # Repeat labels: [l0, l0, l1, l1, ...] shape (2B,)
+                labels_rep = labels.repeat_interleave(two)
+                embeddings = model(views, return_projection=True)  # (2B, D)
+                loss       = criterion(embeddings, labels_rep)
+                batch_n    = B
             else:
-                logits = model(imgs)
-                loss   = criterion(logits, labels)
+                imgs    = batch_data.to(device)
+                logits  = model(imgs)
+                loss    = criterion(logits, labels)
+                batch_n = imgs.size(0)
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            batch_n     = imgs.size(0)
             total_loss += loss.item() * batch_n
             n_samples  += batch_n
 
@@ -321,7 +267,8 @@ def train_one_epoch(
             else:
                 pbar.set_postfix(loss=f"{total_loss / n_samples:.4f}")
 
-    return total_loss / len(loader.dataset)
+    return total_loss / max(n_samples, 1)
+
 
 # Evaluation pass - one epoch
 @torch.no_grad()
@@ -406,8 +353,10 @@ def train(args):
     )
     train_loader, test_loader, val_night_loader = get_dataloaders(
         train_ds, test_ds, val_night_ds,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        label2idx   = label2idx,
+        use_supcon  = use_supcon,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
     )
 
     num_classes = len(label2idx)
@@ -432,8 +381,12 @@ def train(args):
     model.freeze_backbone()
 
     # Loss functions.
-    ce_criterion     = nn.CrossEntropyLoss(label_smoothing=0.1)
-    supcon_criterion = SupConLoss(temperature=0.05)
+    # Cross-entropy uses per-class weights inversely proportional to training
+    # frequency so that rare species receive amplified loss signals.
+    from dataset import get_class_weights
+    class_weights    = get_class_weights(train_ds, label2idx, device)
+    ce_criterion     = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    supcon_criterion = SupConLoss(temperature=0.07)
 
     # Initial optimiser for epoch 1.
     # Without SupCon: backbone frozen, classification head only.
@@ -666,7 +619,9 @@ def train(args):
         f"\n  Log        : {log_path}"
     )
 
+
 # Entry point
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Train DINOv2-base on camera-trap images."
@@ -678,7 +633,7 @@ def parse_args():
     p.add_argument("--warmup_epochs",   type=int,   default=15)
     p.add_argument("--finetune_blocks", type=int,   default=3,
                    help="Number of trailing encoder blocks to unfreeze in Phase 2.")
-    p.add_argument("--batch_size",      type=int,   default=64)
+    p.add_argument("--batch_size",      type=int,   default=72)
     p.add_argument("--lr",              type=float, default=1e-4)
     p.add_argument("--num_workers",     type=int,   default=4)
     p.add_argument("--use_data_adapt",  action="store_true",
