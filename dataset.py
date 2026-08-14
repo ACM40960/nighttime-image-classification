@@ -10,7 +10,6 @@ from torch.utils.data import ConcatDataset, Dataset, DataLoader
 from torchvision import transforms
 
 
-
 # Constants
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
@@ -30,7 +29,6 @@ BBox = Optional[Tuple[int, int, int, int]]
 
 # Default data root.
 DATA_ROOT = "./data"
-
 
 
 # Transforms
@@ -54,7 +52,6 @@ def get_eval_transforms() -> transforms.Compose:
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
-
 
 
 # XML parsing
@@ -88,7 +85,6 @@ def parse_voc_annotation(xml_path: Path) -> Tuple[Optional[str], BBox]:
             bbox = (xmin, ymin, xmax, ymax)
 
     return label, bbox
-
 
 
 # Dataset scanning
@@ -135,7 +131,6 @@ def scan_voc_split(split_dir: Path) -> List[Tuple[Path, str, BBox]]:
     return records
 
 
-
 # Class-balanced stratified split
 def stratified_split(
     records: List[Tuple[Path, str, BBox]],
@@ -179,7 +174,6 @@ def stratified_split(
     main_records = [records[i] for i in sorted(main_idx)]
     val_records  = [records[i] for i in sorted(val_idx)]
     return main_records, val_records
-
 
 
 # PyTorch Dataset
@@ -238,7 +232,6 @@ class WildlifeDataset(Dataset):
         image = self._crop_to_bbox(image, bbox)
         image = self.transform(image)
         return image, self.label2idx[label]
-
 
 
 # Public API
@@ -317,19 +310,141 @@ def build_datasets(
 
     return train_ds, test_ds, val_night_ds, label2idx, idx2label
 
+# PK Sampler
+class PKSampler(torch.utils.data.Sampler):
+    """
+    PK (class-P, samples-K) batch sampler for metric learning.
 
+    Each batch is constructed by:
+      1. Sampling P species uniformly at random (without replacement per batch,
+         with replacement across batches so all species are seen over an epoch).
+      2. Sampling K images per selected species (with replacement when a species
+         has fewer than K samples in the dataset).
+
+    This guarantees every batch contains at least K positives per species, which
+    is the minimum required by Supervised Contrastive Loss to form meaningful
+    positive pairs for all anchors.
+
+    Fixed constants (not exposed as arguments):
+      P = 12  (species per batch)
+      K = 3   (samples per species per batch)
+
+    Effective batch size = P * K = 36 per iteration.
+
+    Parameters
+    ----------
+    dataset    : WildlifeDataset or ConcatDataset used for training.
+    label2idx  : species name to integer index mapping.
+    num_batches: number of batches per epoch.  Defaults to
+                 ceil(len(dataset) / (P * K)) so one epoch sees approximately
+                 the same number of samples as standard random sampling.
+    seed       : random seed for reproducibility.
+    """
+
+    P = 12
+    K = 6
+
+    def __init__(
+        self,
+        dataset,
+        label2idx: Dict[str, int],
+        num_batches: Optional[int] = None,
+        seed: int = SPLIT_SEED,
+    ):
+        self.label2idx   = label2idx
+        self.num_classes = len(label2idx)
+        self.seed        = seed
+
+        # Build index lists grouped by class.
+        self.class_indices: Dict[int, List[int]] = defaultdict(list)
+        if isinstance(dataset, ConcatDataset):
+            offset = 0
+            for ds in dataset.datasets:
+                for local_idx, (_, label, _) in enumerate(ds.records):
+                    self.class_indices[label2idx[label]].append(offset + local_idx)
+                offset += len(ds)
+        else:
+            for idx, (_, label, _) in enumerate(dataset.records):
+                self.class_indices[label2idx[label]].append(idx)
+
+        batch_size = self.P * self.K
+        self.num_batches = (
+            num_batches if num_batches is not None
+            else max(1, (len(dataset) + batch_size - 1) // batch_size)
+        )
+
+    def __len__(self) -> int:
+        return self.num_batches * self.P * self.K
+
+    def __iter__(self):
+        rng = random.Random(self.seed)
+        available_classes = sorted(self.class_indices.keys())
+
+        for _ in range(self.num_batches):
+            # Sample P classes (with replacement if fewer than P classes exist).
+            if len(available_classes) >= self.P:
+                chosen_classes = rng.sample(available_classes, self.P)
+            else:
+                chosen_classes = [
+                    rng.choice(available_classes) for _ in range(self.P)
+                ]
+
+            batch_indices = []
+            for cls in chosen_classes:
+                indices = self.class_indices[cls]
+                if len(indices) >= self.K:
+                    chosen = rng.sample(indices, self.K)
+                else:
+                    # Sample with replacement when fewer than K samples exist.
+                    chosen = [rng.choice(indices) for _ in range(self.K)]
+                batch_indices.extend(chosen)
+
+            yield from batch_indices
+
+
+# DataLoaders
 def get_dataloaders(
     train_ds:     Dataset,
     test_ds:      "WildlifeDataset",
     val_night_ds: "WildlifeDataset",
+    label2idx:    Dict[str, int],
+    use_supcon:   bool = False,
     batch_size:   int = 16,
     num_workers:  int = 4,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Return train, test, and val_night DataLoaders."""
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-    )
+    """
+    Return train, test, and val_night DataLoaders.
+
+    Training loader strategy
+    ------------------------
+    When use_supcon is True:
+      - The training dataset is wrapped in DualViewDataset so each sample
+        produces two independently augmented views.  The batch collation then
+        yields tensors of shape (B, 2, C, H, W) and labels of shape (B,).
+      - A PKSampler (P=10 species, K=3 samples per species) controls index
+        selection, guaranteeing at least K positives per species in every batch.
+      - The effective batch size is P * K = 36 regardless of --batch_size.
+
+    When use_supcon is False:
+      - The training dataset is used directly with shuffle=True.
+      - batch_size from args is used.
+
+    Test and validation loaders always use shuffle=False with no special sampler.
+    """
+    if use_supcon:
+        pk_sampler    = PKSampler(train_ds, label2idx)
+        train_loader  = DataLoader(
+            train_ds,
+            batch_sampler = _PKBatchSampler(pk_sampler),
+            num_workers   = num_workers,
+            pin_memory    = True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True,
+        )
+
     test_loader = DataLoader(
         test_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
@@ -340,6 +455,31 @@ def get_dataloaders(
     )
     return train_loader, test_loader, val_night_loader
 
+
+class _PKBatchSampler(torch.utils.data.BatchSampler):
+    """
+    Thin adapter that converts PKSampler's flat index stream into batches of
+    size P * K for use as batch_sampler in DataLoader.
+
+    PyTorch's DataLoader requires either (sampler + batch_size) or
+    batch_sampler.  PKSampler already yields complete batches implicitly
+    (P*K indices per iteration), so this adapter groups them correctly.
+    """
+
+    def __init__(self, pk_sampler: PKSampler):
+        self.pk_sampler = pk_sampler
+        self.batch_size = pk_sampler.P * pk_sampler.K
+
+    def __len__(self) -> int:
+        return self.pk_sampler.num_batches
+
+    def __iter__(self):
+        batch = []
+        for idx in self.pk_sampler:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
 
 
 # Self-test
@@ -356,7 +496,8 @@ if __name__ == "__main__":
     print(f"Num classes: {len(label2idx)}")
 
     train_loader, _, _ = get_dataloaders(
-        train_ds, test_ds, val_night_ds, batch_size=4, num_workers=0
+        train_ds, test_ds, val_night_ds,
+        label2idx=label2idx, use_supcon=False, batch_size=4, num_workers=0
     )
     imgs, labels = next(iter(train_loader))
     print(f"Batch shape : {imgs.shape}")
