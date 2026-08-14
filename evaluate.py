@@ -1,6 +1,5 @@
 import argparse
 import csv
-import json
 from pathlib import Path
 
 import matplotlib
@@ -144,10 +143,10 @@ def build_confusion_matrix(y_true, y_pred, num_classes):
 def compute_all_metrics(y_true, y_pred, y_probs, num_classes, idx2label):
     tp, tn, fp, fn = per_class_binary_counts(y_true, y_pred, num_classes)
 
-    sensitivity = safe_divide(tp,      tp + fn)
-    specificity = safe_divide(tn,      tn + fp)
-    precision   = safe_divide(tp,      tp + fp)
-    f1          = safe_divide(2 * tp,  2 * tp + fp + fn)
+    sensitivity = safe_divide(tp, tp + fn)
+    specificity = safe_divide(tn, tn + fp)
+    precision   = safe_divide(tp, tp + fp)
+    f1          = safe_divide(2 * tp, 2 * tp + fp + fn)
     acc_per_cls = safe_divide(tp + tn, tp + tn + fp + fn)
 
     auc_roc_per_cls = np.array([
@@ -217,7 +216,7 @@ def save_confusion_matrix(cm_counts, cm_frac, class_names, out_path):
     ax.set_xticklabels(class_names, rotation=45, ha="right", fontsize=18)
     ax.set_yticklabels(class_names, fontsize=18)
     ax.set_xlabel("Predicted", fontsize=22)
-    ax.set_ylabel("True",      fontsize=22)
+    ax.set_ylabel("True", fontsize=22)
     ax.set_title("Confusion Matrix - voc_night (row-normalised fractions)", fontsize=26)
 
     thresh = 0.5
@@ -250,7 +249,7 @@ def save_pr_auc_plot(metrics, class_names, out_path):
         ax.plot(rec, prec, color=cmap(c / len(pr_curves)),
                 linewidth=2.4, alpha=0.8, label=label)
 
-    ax.set_xlabel("Recall",    fontsize=24)
+    ax.set_xlabel("Recall", fontsize=24)
     ax.set_ylabel("Precision", fontsize=24)
     ax.set_title(f"Precision-Recall Curves - voc_night\n"
                  f"Macro PR-AUC = {macro_pr_auc:.4f}", fontsize=26)
@@ -270,18 +269,18 @@ def save_text_report(metrics, out_path):
     ov = metrics["overall"]
     lines = [
         "=" * 72,
-        "  DINOv2-base  |  Wildlife Camera Trap  |  Night-Time Test",
+        " DINOv2-base  |  Wildlife Camera Trap  |  Night-Time Test",
         "=" * 72,
         "",
         "OVERALL (macro-averaged)",
         "-" * 45,
-        f"  Accuracy     : {ov['accuracy']:.4f}",
-        f"  Sensitivity  : {ov['sensitivity']:.4f}",
-        f"  Specificity  : {ov['specificity']:.4f}",
-        f"  Precision    : {ov['precision']:.4f}",
-        f"  F1-score     : {ov['f1']:.4f}",
-        f"  AUC-ROC      : {ov['auc_roc']:.4f}  (macro, one-vs-rest)",
-        f"  PR-AUC       : {ov['pr_auc']:.4f}  (macro, one-vs-rest)",
+        f" Accuracy     : {ov['accuracy']:.4f}",
+        f" Sensitivity  : {ov['sensitivity']:.4f}",
+        f" Specificity  : {ov['specificity']:.4f}",
+        f" Precision    : {ov['precision']:.4f}",
+        f" F1-score     : {ov['f1']:.4f}",
+        f" AUC-ROC      : {ov['auc_roc']:.4f}  (macro, one-vs-rest)",
+        f" PR-AUC       : {ov['pr_auc']:.4f}  (macro, one-vs-rest)",
         "",
         "PER-SPECIES",
         "-" * 45,
@@ -293,7 +292,7 @@ def save_text_report(metrics, out_path):
     lines.append("-" * len(header))
 
     for pc in metrics["per_class"]:
-        roc_str = f"{pc['auc_roc']:.4f}" if not np.isnan(pc["auc_roc"]) else "  N/A "
+        roc_str = f"{pc['auc_roc']:.4f}" if not np.isnan(pc["auc_roc"]) else " N/A "
         pr_str  = f"{pc['pr_auc']:.4f}"
         lines.append(
             f"{pc['class']:<22} {pc['n_samples']:>5} "
@@ -324,11 +323,7 @@ def save_per_class_csv(metrics, out_path):
 
 # Main
 def evaluate(args):
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else
-        "mps"  if torch.backends.mps.is_available() else
-        "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     checkpoint_path = Path(args.checkpoint)
@@ -351,13 +346,15 @@ def evaluate(args):
     model.eval()
 
     # Use the 80% test split of voc_night.
-    _, test_ds, _, _, _ = build_datasets(
+    _, test_ds, _, label2idx_ds, _ = build_datasets(
         args.data_root, use_data_adapt=False
     )
     _, test_loader, _ = get_dataloaders(
         test_ds, test_ds, test_ds,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        label2idx   = label2idx_ds,
+        use_supcon  = False,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
     )
 
     print("\nRunning inference on voc_night test split.")
@@ -371,7 +368,7 @@ def evaluate(args):
     class_names = [idx2label[c] for c in range(num_classes)]
     ts          = run_ts
 
-    save_text_report(metrics,   out_dir / f"evaluation_report_{ts}.txt")
+    save_text_report(metrics, out_dir / f"evaluation_report_{ts}.txt")
     save_per_class_csv(metrics, out_dir / f"metrics_per_class_{ts}.csv")
     save_pr_auc_plot(metrics, class_names, out_dir / f"pr_auc_{ts}.png")
 
@@ -390,11 +387,11 @@ def evaluate(args):
 # Entry point
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained DINOv2 on voc_night.")
-    p.add_argument("--checkpoint",  default="outputs/best_model.pt")
-    p.add_argument("--data_root",   default="./data")
-    p.add_argument("--output_dir",  default="./outputs")
-    p.add_argument("--run_ts",      default="run")
-    p.add_argument("--batch_size",  type=int, default=32)
+    p.add_argument("--checkpoint", default="outputs/best_model.pt")
+    p.add_argument("--data_root", default="./data")
+    p.add_argument("--output_dir", default="./outputs")
+    p.add_argument("--run_ts", default="run")
+    p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=4)
     return p.parse_args()
 

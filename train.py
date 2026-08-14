@@ -26,7 +26,7 @@ class Dinov2Classifier(nn.Module):
     Backbone       : DINOv2-base (ViT-B/14, 12 transformer blocks, hidden dim 768).
     Head           : Dropout(p) -> Linear(768, num_classes).
     Projection head: Linear(768, 768) -> ReLU -> Linear(768, 128), L2-normalised.
-                     Present only when use_supcon is True.  Used during Phase 1
+                     Present only when use_supcon is True. Used during Phase 1
                      SupCon training and discarded in Phase 2.
 
     Backbone state per phase
@@ -38,7 +38,8 @@ class Dinov2Classifier(nn.Module):
     With SupCon:
       Phase 1a : fully frozen (projection head stabilisation).
       Phase 1b : fully unfrozen at lr * 0.02 (contrastive backbone shaping).
-      Phase 2  : re-frozen, then last finetune_blocks blocks unfrozen at lr * 0.05.
+      Phase 2a : fully frozen (classification head training).
+      Phase 2b : frozen except last finetune_blocks blocks and final layer norm.
     """
 
     BACKBONE_ID = "facebook/dinov2-base"
@@ -78,7 +79,7 @@ class Dinov2Classifier(nn.Module):
         """
         Unfreeze the last n transformer encoder blocks and the final layer norm.
 
-        All other backbone parameters remain frozen.  For DINOv2-base with 12
+        All other backbone parameters remain frozen. For DINOv2-base with 12
         encoder blocks total, n=3 unfreezes blocks 9, 10, and 11.
         """
         for param in self.backbone.parameters():
@@ -103,7 +104,7 @@ class Dinov2Classifier(nn.Module):
         ----------
         pixel_values      : (B, 3, 224, 224) normalised image batch.
         return_projection : if True, return the L2-normalised projection
-                            embedding instead of class logits.  Only valid
+                            embedding instead of class logits. Only valid
                             when use_supcon is True.
 
         Returns
@@ -123,10 +124,8 @@ class Dinov2Classifier(nn.Module):
 # Supervised Contrastive Loss
 class SupConLoss(nn.Module):
     """
-    Supervised Contrastive Loss (Khosla et al., NeurIPS 2020).
-
     For each anchor sample, all samples sharing the same class label are
-    treated as positives and all others as negatives.  The loss encourages
+    treated as positives and all others as negatives. The loss encourages
     the model to produce embeddings where same-class samples cluster together
     on the unit hypersphere.
 
@@ -200,19 +199,6 @@ def train_one_epoch(
     """
     Run one full pass over the training DataLoader.
 
-    Batch format
-    ------------
-    When use_supcon_active is True the loader yields (views, labels) where
-    views has shape (B, 2, C, H, W) — two independently augmented views of
-    each image produced by DualViewDataset.  Both views are forwarded through
-    the projection head and concatenated into a (2B, D) embedding tensor.
-    Labels are correspondingly repeated to (2B,) so each view is associated
-    with the correct species class.  The SupConLoss then has guaranteed
-    positive pairs: view1[i] and view2[i] share the same label.
-
-    When use_supcon_active is False the loader yields standard (imgs, labels)
-    tensors and the classification head is used with cross-entropy.
-
     Parameters
     ----------
     sub_phase        : string label for the tqdm bar (e.g. "1a", "1b", "2").
@@ -227,7 +213,7 @@ def train_one_epoch(
     n_correct  = 0
     n_samples  = 0
 
-    desc = f"  Train E{epoch:>2}/{total_epochs} [phase {sub_phase}]"
+    desc = f" Train E{epoch:>2}/{total_epochs} [phase {sub_phase}]"
     with tqdm(loader, desc=desc, leave=False, unit="batch",
               bar_format="{l_bar}{bar:25}{r_bar}") as pbar:
         for imgs, labels in pbar:
@@ -271,15 +257,13 @@ def evaluate(
 ) -> dict:
     """
     Run inference on a DataLoader and return loss, accuracy, and macro-F1.
-
-    Always uses the classification head regardless of SupCon setting.
     """
     model.eval()
     total_loss = 0.0
     all_preds  = []
     all_labels = []
 
-    desc = f"  {split_name:<8} E{epoch:>2}/{total_epochs}"
+    desc = f" {split_name:<8} E{epoch:>2}/{total_epochs}"
     with tqdm(loader, desc=desc, leave=False, unit="batch",
               bar_format="{l_bar}{bar:25}{r_bar}") as pbar:
         for imgs, labels in pbar:
@@ -331,10 +315,10 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    use_data_adapt  = getattr(args, "use_data_adapt",  False)
-    use_supcon      = getattr(args, "use_supcon",       False)
-    finetune_blocks = getattr(args, "finetune_blocks",  3)
-    run_ts          = getattr(args, "run_ts",           "run")
+    use_data_adapt  = getattr(args, "use_data_adapt", False)
+    use_supcon      = getattr(args, "use_supcon", False)
+    finetune_blocks = getattr(args, "finetune_blocks", 3)
+    run_ts          = getattr(args, "run_ts", "run")
 
     # Datasets and loaders
     train_ds, test_ds, val_night_ds, label2idx, idx2label = build_datasets(
@@ -351,17 +335,17 @@ def train(args):
     num_classes = len(label2idx)
 
     # SupCon epoch boundaries.
-    # Phase 1a: epochs 1 .. supcon_freeze_end  (backbone frozen, proj head, SupCon)
-    # Phase 1b: epochs supcon_freeze_end+1 .. warmup_epochs  (backbone unfrozen, SupCon)
-    # Phase 2 : epochs warmup_epochs+1 .. total_epochs  (last N blocks, CE)
-    #
-    # When SupCon is off, supcon_freeze_end is unused; all warmup_epochs are
-    # standard Phase 1 (backbone frozen, classification head, CE).
-    SUPCON_HEAD_STABILISE = 5
+    # Phase 1a : epochs 1 .. supcon_freeze_end        (backbone frozen, proj head, SupCon)
+    # Phase 1b : epochs supcon_freeze_end+1 .. warmup_epochs  (full backbone, SupCon)
+    # Phase 2a : epochs warmup_epochs+1 .. phase2a_freeze_end (backbone frozen, class head, CE)
+    # Phase 2b : epochs phase2a_freeze_end+1 .. total         (last N blocks, CE)
+    HEAD_STABILISE = 5
     if use_supcon:
-        supcon_freeze_end = min(SUPCON_HEAD_STABILISE, args.warmup_epochs)
+        supcon_freeze_end  = min(HEAD_STABILISE, args.warmup_epochs)
+        phase2a_freeze_end = args.warmup_epochs + HEAD_STABILISE
     else:
-        supcon_freeze_end = args.warmup_epochs  # unused but defined for clarity
+        supcon_freeze_end  = args.warmup_epochs  # unused but defined for clarity
+        phase2a_freeze_end = args.warmup_epochs  # unused
 
     # Model
     model = Dinov2Classifier(
@@ -413,40 +397,41 @@ def train(args):
 
     # Training header
     print(f"\n{'='*60}")
-    print(f"  Model    : DINOv2-base  ({num_classes} classes)")
-    print(f"  Train    : {len(train_ds)} samples, "
+    print(f" Model    : DINOv2-base  ({num_classes} classes)")
+    print(f" Train    : {len(train_ds)} samples, "
           f"Val night : {len(val_night_ds)} samples, "
           f"Test : {len(test_ds)} samples")
     if use_supcon:
-        print(f"  Epochs   : {args.epochs} total  ("
-              f"phase 1a: {supcon_freeze_end}, "
-              f"phase 1b: {max(0, args.warmup_epochs - supcon_freeze_end)}, "
-              f"phase 2: {args.epochs - args.warmup_epochs})")
+        n_1a = supcon_freeze_end
+        n_1b = max(0, args.warmup_epochs - supcon_freeze_end)
+        n_2a = HEAD_STABILISE
+        n_2b = max(0, args.epochs - args.warmup_epochs - HEAD_STABILISE)
+        print(f" Epochs   : {args.epochs} total  ("
+              f"1a: {n_1a}, 1b: {n_1b}, 2a: {n_2a}, 2b: {n_2b})")
     else:
-        print(f"  Epochs   : {args.epochs} total  ("
+        print(f" Epochs   : {args.epochs} total  ("
               f"phase 1: {args.warmup_epochs}, "
               f"phase 2: {args.epochs - args.warmup_epochs})")
-    print(f"  LR       : {args.lr}  "
-          f"(backbone phase 1b: {args.lr * 0.02}, phase 2: {args.lr * 0.05})")
-    print(f"  Batch    : {args.batch_size}")
+    print(f" LR       : {args.lr}  "
+          f"(backbone phase 1b: {args.lr * 0.02}, phase 2: {args.lr * 0.04})")
+    print(f" Batch    : {args.batch_size}")
     adapt_parts = []
     if use_data_adapt:
         adapt_parts.append("data adaptation (medium)")
     if use_supcon:
         adapt_parts.append("supervised contrastive loss")
-    print(f"  Options  : {', '.join(adapt_parts) if adapt_parts else 'none (baseline)'}")
+    print(f" Options  : {', '.join(adapt_parts) if adapt_parts else 'none (baseline)'}")
     print(f"{'='*60}\n")
 
     epoch_bar = tqdm(
         range(1, args.epochs + 1),
-        desc="  Epochs", unit="ep",
+        desc=" Epochs", unit="ep",
         bar_format="{l_bar}{bar:30}{r_bar}",
     )
 
     for epoch in epoch_bar:
 
         # Determine sub-phase and apply any transitions
-
         if not use_supcon:
             # Standard two-phase schedule.
             if epoch == args.warmup_epochs + 1:
@@ -460,8 +445,8 @@ def train(args):
                 head_params     = list(model.head.parameters())
                 optimizer = AdamW(
                     [
-                        {"params": backbone_params, "lr": args.lr * 0.05},
-                        {"params": head_params,     "lr": args.lr},
+                        {"params": backbone_params, "lr": args.lr * 0.04},
+                        {"params": head_params, "lr": args.lr},
                     ],
                     weight_decay=1e-4,
                 )
@@ -473,7 +458,7 @@ def train(args):
             active_crit     = ce_criterion
 
         else:
-            # SupCon three-sub-stage schedule.
+            # SupCon four-sub-phase schedule.
             if epoch == supcon_freeze_end + 1 and supcon_freeze_end < args.warmup_epochs:
                 # Transition: Phase 1a -> Phase 1b.
                 # Unfreeze full backbone at a small LR; projection head at full LR.
@@ -484,44 +469,59 @@ def train(args):
                 model.unfreeze_backbone()
                 backbone_params = list(model.backbone.parameters())
                 proj_params     = list(model.proj_head.parameters())
-                # Classification head still excluded — not trained until Phase 2.
                 optimizer = AdamW(
                     [
                         {"params": backbone_params, "lr": args.lr * 0.02},
-                        {"params": proj_params,     "lr": args.lr},
+                        {"params": proj_params, "lr": args.lr},
                     ],
                     weight_decay=1e-4,
                 )
-                # Re-initialise scheduler over the remaining warmup epochs.
                 remaining_warmup = args.warmup_epochs - supcon_freeze_end
                 scheduler = CosineAnnealingLR(
                     optimizer, T_max=max(remaining_warmup, 1)
                 )
 
             elif epoch == args.warmup_epochs + 1:
-                # Transition: Phase 1b -> Phase 2.
-                # Re-freeze backbone, then unfreeze only the last N blocks.
+                # Transition: Phase 1b -> Phase 2a.
+                # Re-freeze entire backbone. Train only the classification head.
+                # The projection head is excluded from this point onwards.
                 tqdm.write(
-                    f"\nPhase 2: re-freezing backbone, unfreezing last "
-                    f"{finetune_blocks} encoder blocks. Switching to cross-entropy."
+                    f"\nPhase 2a: backbone fully frozen. "
+                    f"Stabilising classification head for {HEAD_STABILISE} epochs."
+                )
+                model.freeze_backbone()
+                head_params = list(model.head.parameters())
+                # Classification head enters training for the first time.
+                # Projection head excluded — discarded after Phase 1.
+                optimizer = AdamW(head_params, lr=args.lr, weight_decay=1e-4)
+                scheduler = CosineAnnealingLR(
+                    optimizer, T_max=HEAD_STABILISE
+                )
+
+            elif epoch == phase2a_freeze_end + 1:
+                # Transition: Phase 2a -> Phase 2b.
+                # Unfreeze the last N encoder blocks at the reduced backbone LR.
+                tqdm.write(
+                    f"\nPhase 2b: unfreezing last {finetune_blocks} encoder blocks "
+                    f"(backbone LR = {args.lr * 0.04})."
                 )
                 model.unfreeze_last_blocks(n=finetune_blocks)
                 backbone_params = [p for p in model.backbone.parameters()
                                    if p.requires_grad]
-                # Classification head enters training for the first time.
-                # Projection head excluded — discarded after Phase 1.
-                head_params = list(model.head.parameters())
+                head_params     = list(model.head.parameters())
                 optimizer = AdamW(
                     [
-                        {"params": backbone_params, "lr": args.lr * 0.05},
-                        {"params": head_params,     "lr": args.lr},
+                        {"params": backbone_params, "lr": args.lr * 0.04},
+                        {"params": head_params, "lr": args.lr},
                     ],
                     weight_decay=1e-4,
                 )
                 scheduler = CosineAnnealingLR(
-                    optimizer, T_max=args.epochs - args.warmup_epochs
+                    optimizer,
+                    T_max=max(args.epochs - phase2a_freeze_end, 1)
                 )
 
+            # Assign sub-phase label and active loss.
             if epoch <= supcon_freeze_end:
                 sub_phase      = "1a"
                 use_supcon_now = True
@@ -530,8 +530,12 @@ def train(args):
                 sub_phase      = "1b"
                 use_supcon_now = True
                 active_crit    = supcon_criterion
+            elif epoch <= phase2a_freeze_end:
+                sub_phase      = "2a"
+                use_supcon_now = False
+                active_crit    = ce_criterion
             else:
-                sub_phase      = "2"
+                sub_phase      = "2b"
                 use_supcon_now = False
                 active_crit    = ce_criterion
 
@@ -558,7 +562,7 @@ def train(args):
         )
 
         tqdm.write(
-            f"  Epoch {epoch:>3}/{args.epochs} [phase {sub_phase}]  "
+            f" Epoch {epoch:>3}/{args.epochs} [phase {sub_phase}]  "
             f"train_loss={train_loss:.4f}  "
             f"val_night(loss={val_night_m['loss']:.4f}  "
             f"acc={val_night_m['accuracy']:.4f}  "
@@ -575,10 +579,10 @@ def train(args):
         ])
         log_file.flush()
 
-        # Checkpoint only in phase 2 or when SupCon is off (phase 1 or 2).
-        # During SupCon phases 1a/1b the classification head is not being
-        # trained, so val_night_f1 is not yet meaningful for checkpointing.
-        should_checkpoint = (sub_phase == "2") or (not use_supcon)
+        # Checkpoint during classification phases only.
+        # With SupCon: phases 2a and 2b (classification head is training).
+        # Without SupCon: phases 1 and 2 (classification head always training).
+        should_checkpoint = (sub_phase in ("2", "2a", "2b")) or (not use_supcon)
         if should_checkpoint and val_night_m["macro_f1"] > best_f1:
             best_f1    = val_night_m["macro_f1"]
             best_epoch = epoch
@@ -596,7 +600,7 @@ def train(args):
                 best_path,
             )
             tqdm.write(
-                f"  Best model saved at epoch {epoch} "
+                f" Best model saved at epoch {epoch} "
                 f"(val_night macro-F1 = {best_f1:.4f})."
             )
 
@@ -614,20 +618,20 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Train DINOv2-base on camera-trap images."
     )
-    p.add_argument("--data_root",       default="./data")
-    p.add_argument("--output_dir",      default="./outputs")
-    p.add_argument("--run_ts",          default="run")
-    p.add_argument("--epochs",          type=int,   default=30)
-    p.add_argument("--warmup_epochs",   type=int,   default=15)
-    p.add_argument("--finetune_blocks", type=int,   default=3,
+    p.add_argument("--data_root", default="./data")
+    p.add_argument("--output_dir", default="./outputs")
+    p.add_argument("--run_ts", default="run")
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--warmup_epochs", type=int, default=15)
+    p.add_argument("--finetune_blocks", type=int, default=3,
                    help="Number of trailing encoder blocks to unfreeze in Phase 2.")
-    p.add_argument("--batch_size",      type=int,   default=76)
-    p.add_argument("--lr",              type=float, default=1e-4)
-    p.add_argument("--num_workers",     type=int,   default=4)
-    p.add_argument("--use_data_adapt",  action="store_true",
+    p.add_argument("--batch_size", type=int, default=76)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--use_data_adapt", action="store_true",
                    help="Append night-simulated copies of daytime images to the "
                         "training set.")
-    p.add_argument("--use_supcon",      action="store_true",
+    p.add_argument("--use_supcon", action="store_true",
                    help="Use supervised contrastive loss during the warmup phase "
                         "instead of cross-entropy.")
     return p.parse_args()

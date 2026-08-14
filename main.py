@@ -19,7 +19,7 @@ CONFIG = dict(
     epochs          = 30,
     warmup_epochs   = 15,
     finetune_blocks = 3,
-    batch_size      = 64,
+    batch_size      = 76,
     lr              = 1e-4,
     num_workers     = 4,
     use_data_adapt  = False,
@@ -52,10 +52,10 @@ def step_verify(cfg) -> tuple:
               "Check voc_night/Annotations and voc_night/JPEGImages.")
         sys.exit(1)
 
-    print(f"  Train      : {len(train_ds)}")
-    print(f"  Test       : {len(test_ds)}")
-    print(f"  Val night  : {len(val_night_ds)}")
-    print(f"  Classes ({len(label2idx)}) : {sorted(label2idx)}")
+    print(f" Train      : {len(train_ds)}")
+    print(f" Test       : {len(test_ds)}")
+    print(f" Val night  : {len(val_night_ds)}")
+    print(f" Classes ({len(label2idx)}) : {sorted(label2idx)}")
     print("\n  Data verification passed.")
 
     return train_ds, test_ds, val_night_ds, label2idx, idx2label
@@ -72,9 +72,9 @@ def step_train(cfg):
     if cfg.use_supcon:
         options.append("supervised contrastive loss")
     if options:
-        print(f"  Active options: {', '.join(options)}")
+        print(f" Active options: {', '.join(options)}")
     else:
-        print("  Active options: none (baseline mode)")
+        print(" Active options: none (baseline mode)")
     print()
 
     t0 = time.time()
@@ -88,7 +88,7 @@ def step_train(cfg):
 
     mins, secs = divmod(int(elapsed), 60)
     print(f"\n  Training complete in {mins}m {secs}s.")
-    print(f"  Checkpoint : {checkpoint}")
+    print(f" Checkpoint : {checkpoint}")
 
 
 # Step 3 - Evaluate
@@ -110,20 +110,20 @@ def step_evaluate(cfg):
     ts  = cfg.run_ts
     out = Path(cfg.output_dir)
     print(f"\n  Evaluation complete. Outputs written to {out}/")
-    print(f"    evaluation_report_{ts}.txt")
-    print(f"    metrics_per_class_{ts}.csv")
-    print(f"    confusion_matrix_{ts}.png")
-    print(f"    confusion_matrix_{ts}.csv")
-    print(f"    pr_auc_{ts}.png")
+    print(f" evaluation_report_{ts}.txt")
+    print(f" metrics_per_class_{ts}.csv")
+    print(f" confusion_matrix_{ts}.png")
+    print(f" confusion_matrix_{ts}.csv")
+    print(f" pr_auc_{ts}.png")
 
 
 # Summary
 def print_summary(cfg, total_elapsed: float):
     banner("PIPELINE COMPLETE", width=60)
     mins, secs = divmod(int(total_elapsed), 60)
-    print(f"  Run ID     : {cfg.run_ts}")
-    print(f"  Wall time  : {mins}m {secs}s")
-    print(f"  Outputs    : {Path(cfg.output_dir).resolve()}")
+    print(f" Run ID     : {cfg.run_ts}")
+    print(f" Wall time  : {mins}m {secs}s")
+    print(f" Outputs    : {Path(cfg.output_dir).resolve()}")
     print()
 
 # CLI
@@ -132,23 +132,23 @@ def parse_args():
         description="Wildlife camera-trap classifier - DINOv2-base pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data_root",       default=DATA_ROOT,
+    p.add_argument("--data_root", default=DATA_ROOT,
                    help="Root directory containing voc_day/ and voc_night/.")
-    p.add_argument("--epochs",          type=int,   default=CONFIG["epochs"])
-    p.add_argument("--warmup_epochs",   type=int,   default=CONFIG["warmup_epochs"],
+    p.add_argument("--epochs", type=int, default=CONFIG["epochs"])
+    p.add_argument("--warmup_epochs", type=int, default=CONFIG["warmup_epochs"],
                    help="Epochs to train with backbone fully frozen.")
-    p.add_argument("--finetune_blocks", type=int,   default=CONFIG["finetune_blocks"],
+    p.add_argument("--finetune_blocks", type=int, default=CONFIG["finetune_blocks"],
                    help="Number of trailing encoder blocks to unfreeze in Phase 2.")
-    p.add_argument("--batch_size",      type=int,   default=CONFIG["batch_size"],
+    p.add_argument("--batch_size", type=int, default=CONFIG["batch_size"],
                    help="Training and evaluation batch size.")
-    p.add_argument("--lr",              type=float, default=CONFIG["lr"],
+    p.add_argument("--lr", type=float, default=CONFIG["lr"],
                    help="Head learning rate. Backbone uses lr * 0.05 in Phase 2.")
-    p.add_argument("--num_workers",     type=int,   default=CONFIG["num_workers"],
+    p.add_argument("--num_workers", type=int, default=CONFIG["num_workers"],
                    help="DataLoader worker processes.")
-    p.add_argument("--use_data_adapt",  action="store_true",
+    p.add_argument("--use_data_adapt", action="store_true",
                    default=CONFIG["use_data_adapt"],
                    help="Append night-simulated copies of daytime training images.")
-    p.add_argument("--use_supcon",      action="store_true",
+    p.add_argument("--use_supcon", action="store_true",
                    default=CONFIG["use_supcon"],
                    help="Use supervised contrastive loss during the warmup phase.")
     return p.parse_args()
@@ -167,16 +167,16 @@ def main():
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
     banner("WILDLIFE SPECIES CLASSIFIER  -  DINOv2-BASE", width=60)
-    print(f"  Run ID         : {cfg.run_ts}")
-    print(f"  Data root      : {cfg.data_root}")
-    print(f"  Output dir     : {cfg.output_dir}")
-    print(f"  Epochs         : {cfg.epochs} "
+    print(f" Run ID         : {cfg.run_ts}")
+    print(f" Data root      : {cfg.data_root}")
+    print(f" Output dir     : {cfg.output_dir}")
+    print(f" Epochs         : {cfg.epochs} "
           f"(warmup: {cfg.warmup_epochs}, finetune blocks: {cfg.finetune_blocks})")
-    print(f"  Batch size     : {cfg.batch_size}")
-    print(f"  Learning rate  : {cfg.lr} (backbone: {cfg.lr * 0.05})")
-    print(f"  Workers        : {cfg.num_workers}")
-    print(f"  Data adapt     : {'on' if cfg.use_data_adapt else 'off'}")
-    print(f"  SupCon         : {'on' if cfg.use_supcon else 'off'}")
+    print(f" Batch size     : {cfg.batch_size}")
+    print(f" Learning rate  : {cfg.lr}")
+    print(f" Workers        : {cfg.num_workers}")
+    print(f" Data adapt     : {'on' if cfg.use_data_adapt else 'off'}")
+    print(f" SupCon         : {'on' if cfg.use_supcon else 'off'}")
 
     t_start = time.time()
 

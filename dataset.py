@@ -285,8 +285,8 @@ def build_datasets(
         night_known, val_fraction=0.20, seed=SPLIT_SEED
     )
 
-    print(f"  voc_day   : {len(day_records)} training samples (100%)")
-    print(f"  voc_night : {len(test_records)} test / {len(val_night_records)} validation\n")
+    print(f" voc_day   : {len(day_records)} training samples (100%)")
+    print(f" voc_night : {len(test_records)} test / {len(val_night_records)} validation\n")
 
     # Original training dataset with standard augmentation
     original_train_ds = WildlifeDataset(day_records, label2idx, get_train_transforms())
@@ -299,13 +299,13 @@ def build_datasets(
         )
         # Concatenate original and adapted datasets so the model sees both
         train_ds = ConcatDataset([original_train_ds, adapted_train_ds])
-        print(f"  Training set: {len(original_train_ds)} original + "
+        print(f" Training set: {len(original_train_ds)} original + "
               f"{len(adapted_train_ds)} adapted = {len(train_ds)} total samples.")
     else:
         train_ds = original_train_ds
-        print(f"  Training set: {len(train_ds)} samples (original only).")
+        print(f" Training set: {len(train_ds)} samples (original only).")
 
-    test_ds      = WildlifeDataset(test_records,      label2idx, get_eval_transforms())
+    test_ds      = WildlifeDataset(test_records, label2idx, get_eval_transforms())
     val_night_ds = WildlifeDataset(val_night_records, label2idx, get_eval_transforms())
 
     return train_ds, test_ds, val_night_ds, label2idx, idx2label
@@ -329,7 +329,7 @@ class MinKBatchSampler(torch.utils.data.BatchSampler):
     batch_size is respected exactly.  Species with fewer than MIN_K total
     training samples are filled with replacement from their available pool.
 
-    MIN_K is fixed at 3 and is not exposed as a CLI argument.
+    MIN_K is fixed at 4 and is not exposed as a CLI argument.
 
     Parameters
     ----------
@@ -430,7 +430,7 @@ def get_class_weights(
     dataset: Dataset,
     label2idx: Dict[str, int],
     device: "torch.device",
-    max_weight: float = 3.0,
+    max_weight: float = 2.5,
 ) -> "torch.Tensor":
     """
     Compute per-class weights for weighted cross-entropy loss.
@@ -440,10 +440,6 @@ def get_class_weights(
     max_weight to prevent severely underrepresented classes (e.g. species with
     fewer than 50 training samples) from producing disproportionately large
     loss signals that cause the model to collapse toward predicting that class.
-
-    Without the cap, a class with 5-50 samples in a 15,000-sample dataset
-    receives a weight 10-50x higher than the median class, overwhelming the
-    gradient signal from all other species.
 
     Parameters
     ----------
@@ -470,9 +466,7 @@ def get_class_weights(
 
     weights = 1.0 / counts.clamp(min=1)
     weights = weights / weights.mean()
-    weights = weights.clamp(max=max_weight)   # cap extreme amplification
 
-    # override weights for rare species
     override_multiplier = 2.0
     override_species = ["RaccoonDog", "Sable", "MuskDeer"]
     for species in override_species:
@@ -480,12 +474,24 @@ def get_class_weights(
             idx = label2idx[species]
             weights[idx] = min(weights[idx] * override_multiplier, max_weight)
         else:
-            print(f"[WARNING] Override species not found in label2idx: {species}")
+            print(f"[WARNING] Override underrepresented species not found in label2idx: {species}")
+
+    override_overrepresented_multiplier = 0.3
+    override_overrepresented = ["Badger", "RoeDeer", "Weasel"]
+    for species in override_overrepresented:
+        if species in label2idx:
+            idx = label2idx[species]
+            weights[idx] = max(weights[idx] * override_overrepresented_multiplier, 0.05)
+        else:
+            print(f"[WARNING] Override overrepresented species not found in label2idx: {species}")
+
+    # cap extreme amplification
+    weights = weights.clamp(max=max_weight)
+
     return weights.to(device)
 
 
 # DataLoaders
-
 def get_dataloaders(
     train_ds:     Dataset,
     test_ds:      "WildlifeDataset",
@@ -502,7 +508,7 @@ def get_dataloaders(
     ------------------------
     When use_supcon is True:
       - MinKBatchSampler ensures every species in a batch appears at least
-        MIN_K = 3 times.  batch_size is respected exactly.
+        MIN_K = 4 times.  batch_size is respected exactly.
       - When use_data_adapt is also active, the training set is a ConcatDataset
         of original and night-simulated copies of every daytime image.  Sample
         index i in the original half and index i+N in the adapted half are
