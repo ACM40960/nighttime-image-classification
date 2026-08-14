@@ -1,0 +1,40 @@
+{
+  "label2idx": {
+    "AmurTiger": 0,
+    "Badger": 1,
+    "BlackBear": 2,
+    "Cow": 3,
+    "Dog": 4,
+    "Hare": 5,
+    "Leopard": 6,
+    "LeopardCat": 7,
+    "MuskDeer": 8,
+    "RaccoonDog": 9,
+    "RedFox": 10,
+    "RoeDeer": 11,
+    "Sable": 12,
+    "SikaDeer": 13,
+    "Weasel": 14,
+    "WildBoar": 15,
+    "Y.T.Marten": 16
+  },
+  "idx2label": {
+    "0": "AmurTiger",
+    "1": "Badger",
+    "2": "BlackBear",
+    "3": "Cow",
+    "4": "Dog",
+    "5": "Hare",
+    "6": "Leopard",
+    "7": "LeopardCat",
+    "8": "MuskDeer",
+    "9": "RaccoonDog",
+    "10": "RedFox",
+    "11": "RoeDeer",
+    "12": "Sable",
+    "13": "SikaDeer",
+    "14": "Weasel",
+    "15": "WildBoar",
+    "16": "Y.T.Marten"
+  }
+}
