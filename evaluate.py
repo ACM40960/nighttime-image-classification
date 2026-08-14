@@ -207,18 +207,18 @@ def save_confusion_matrix(cm_counts, cm_frac, class_names, out_path):
     Colour intensity reflects the fraction.
     """
     n   = len(class_names)
-    fig, ax = plt.subplots(figsize=(max(8, n), max(6, n - 2)))
+    fig, ax = plt.subplots(figsize=(max(16, n * 2), max(12, (n - 2) * 2)))
 
     im = ax.imshow(cm_frac, interpolation="nearest", cmap="Blues", vmin=0, vmax=1)
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Fraction")
 
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
-    ax.set_xticklabels(class_names, rotation=45, ha="right", fontsize=9)
-    ax.set_yticklabels(class_names, fontsize=9)
-    ax.set_xlabel("Predicted", fontsize=11)
-    ax.set_ylabel("True",      fontsize=11)
-    ax.set_title("Confusion Matrix — voc_night (row-normalised fractions)", fontsize=13)
+    ax.set_xticklabels(class_names, rotation=45, ha="right", fontsize=18)
+    ax.set_yticklabels(class_names, fontsize=18)
+    ax.set_xlabel("Predicted", fontsize=22)
+    ax.set_ylabel("True",      fontsize=22)
+    ax.set_title("Confusion Matrix - voc_night (row-normalised fractions)", fontsize=26)
 
     thresh = 0.5
     for i in range(n):
@@ -226,7 +226,7 @@ def save_confusion_matrix(cm_counts, cm_frac, class_names, out_path):
             ax.text(j, i, f"{cm_frac[i, j]:.3f}",
                     ha="center", va="center",
                     color="white" if cm_frac[i, j] > thresh else "black",
-                    fontsize=7)
+                    fontsize=14)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -238,25 +238,26 @@ def save_pr_auc_plot(metrics, class_names, out_path):
     """
     Save a PR curve plot — one curve per species plus the macro average.
     """
-    pr_curves  = metrics["pr_curves"]
-    per_class  = metrics["per_class"]
+    pr_curves    = metrics["pr_curves"]
+    per_class    = metrics["per_class"]
     macro_pr_auc = metrics["overall"]["pr_auc"]
 
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig, ax = plt.subplots(figsize=(20, 14))
 
     cmap = plt.get_cmap("tab20")
     for c, (prec, rec) in enumerate(pr_curves):
         label = f"{class_names[c]} (AUC={per_class[c]['pr_auc']:.3f})"
         ax.plot(rec, prec, color=cmap(c / len(pr_curves)),
-                linewidth=1.2, alpha=0.8, label=label)
+                linewidth=2.4, alpha=0.8, label=label)
 
-    ax.set_xlabel("Recall",    fontsize=12)
-    ax.set_ylabel("Precision", fontsize=12)
-    ax.set_title(f"Precision-Recall Curves — voc_night\n"
-                 f"Macro PR-AUC = {macro_pr_auc:.4f}", fontsize=13)
+    ax.set_xlabel("Recall",    fontsize=24)
+    ax.set_ylabel("Precision", fontsize=24)
+    ax.set_title(f"Precision-Recall Curves - voc_night\n"
+                 f"Macro PR-AUC = {macro_pr_auc:.4f}", fontsize=26)
     ax.set_xlim([0.0, 1.0])
     ax.set_ylim([0.0, 1.05])
-    ax.legend(loc="lower left", fontsize=7, ncol=2)
+    ax.tick_params(axis="both", labelsize=18)
+    ax.legend(loc="lower left", fontsize=14, ncol=2)
     ax.grid(alpha=0.3)
 
     plt.tight_layout()
@@ -319,7 +320,6 @@ def save_per_class_csv(metrics, out_path):
             w.writerow({k: (f"{pc[k]:.6f}" if isinstance(pc[k], float) else pc[k])
                         for k in fields})
     print(f"Per-class CSV saved: {out_path}")
-
 
 
 # Main
@@ -385,7 +385,6 @@ def evaluate(args):
         for i, row in enumerate(cm_frac):
             w.writerow([class_names[i]] + [f"{v:.6f}" for v in row])
     print(f"Confusion matrix CSV saved: {out_dir / f'confusion_matrix_{ts}.csv'}")
-
 
 
 # Entry point
