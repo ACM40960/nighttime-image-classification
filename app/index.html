@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wildlife Species Classifier</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f5f5;
+      color: #1a1a1a;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px;
+    }
+    h1 { font-size: 1.6rem; margin-bottom: 6px; }
+    .subtitle { color: #555; font-size: 0.9rem; margin-bottom: 26px; }
+    .note { color: #888; font-size: 0.78rem; margin-bottom: 32px; }
+    .layout {
+      display: flex;
+      gap: 24px;
+      width: 100%;
+      max-width: 1020px;
+      align-items: flex-start;
+    }
+    .panel {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 28px;
+      flex: 1;
+      min-width: 0;
+    }
+    .panel-title {
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #999;
+      margin-bottom: 16px;
+    }
+    .drop-zone {
+      border: 2px dashed #ccc;
+      border-radius: 8px;
+      padding: 36px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      margin-bottom: 16px;
+    }
+    .drop-zone:hover, .drop-zone.drag-over {
+      border-color: #4f8ef7;
+      background: #f0f5ff;
+    }
+    .drop-zone p { color: #777; font-size: 0.85rem; margin-top: 8px; }
+    #preview {
+      width: 100%;
+      max-height: 320px;
+      object-fit: contain;
+      border-radius: 6px;
+      margin-bottom: 16px;
+      display: none;
+    }
+    button {
+      width: 100%;
+      padding: 11px;
+      background: #4f8ef7;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #3a7ae0; }
+    button:disabled { background: #aac4f5; cursor: not-allowed; }
+    .result-empty {
+      color: #bbb;
+      font-size: 0.9rem;
+      text-align: center;
+      padding: 48px 0;
+    }
+    .result-primary {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #1a1a1a;
+      margin-bottom: 4px;
+    }
+    .result-conf {
+      color: #555;
+      font-size: 0.9rem;
+      margin-bottom: 24px;
+    }
+    .top5-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #bbb;
+      margin-bottom: 10px;
+    }
+    .top5 { list-style: none; }
+    .top5 li {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 0.88rem;
+    }
+    .top5 li:last-child { border-bottom: none; }
+    .species-name { min-width: 110px; }
+    .bar-wrap {
+      flex: 1;
+      background: #f0f0f0;
+      border-radius: 4px;
+      height: 6px;
+      margin: 0 12px;
+    }
+    .bar {
+      background: #4f8ef7;
+      border-radius: 4px;
+      height: 6px;
+      transition: width 0.4s ease;
+    }
+    .conf-val { color: #777; min-width: 40px; text-align: right; }
+    .error { color: #d32f2f; margin-top: 12px; font-size: 0.85rem; }
+    .classes {
+      margin-top: 28px;
+      font-size: 0.75rem;
+      color: #aaa;
+      line-height: 1.7;
+      text-align: center;
+      max-width: 1020px;
+    }
+    @media (max-width: 640px) {
+      .layout { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Wildlife Species Classifier</h1>
+  <p class="subtitle">DINOv2-base &middot; <span id="numClasses"></span> species &middot; nighttime camera-trap images</p>
+
+  <div class="layout">
+
+    <!-- LEFT: image input -->
+    <div class="panel">
+      <div class="panel-title">Image</div>
+      <div class="drop-zone" id="dropZone">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none"
+             stroke="#bbb" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <p>Drop an image here or click to browse</p>
+        <input type="file" id="fileInput" accept="image/*" style="display:none">
+      </div>
+      <img id="preview" alt="Preview">
+      <button id="classifyBtn" disabled>Classify</button>
+      <div class="error" id="errorMsg"></div>
+    </div>
+
+    <!-- RIGHT: prediction results -->
+    <div class="panel">
+      <div class="panel-title">Prediction</div>
+      <div id="resultEmpty" class="result-empty">Upload an image and click Classify.</div>
+      <div id="result" style="display:none">
+        <div class="result-primary" id="topSpecies"></div>
+        <div class="result-conf"    id="topConf"></div>
+        <div class="top5-label">Top 5 candidates</div>
+        <ul class="top5" id="top5List"></ul>
+      </div>
+    </div>
+
+  </div>
+
+  <p class="classes" id="classesList"></p>
+
+  <script>
+    // Fetch model metadata from the API and populate dynamic labels.
+    fetch("/info")
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById("numClasses").textContent = data.num_classes;
+        document.getElementById("classesList").innerHTML =
+          "<strong>Species:</strong> " + data.classes.join(", ");
+      });
+
+    const dropZone    = document.getElementById("dropZone");
+    const fileInput   = document.getElementById("fileInput");
+    const preview     = document.getElementById("preview");
+    const btn         = document.getElementById("classifyBtn");
+    const result      = document.getElementById("result");
+    const resultEmpty = document.getElementById("resultEmpty");
+    const errorMsg    = document.getElementById("errorMsg");
+    const topSpecies  = document.getElementById("topSpecies");
+    const topConf     = document.getElementById("topConf");
+    const top5List    = document.getElementById("top5List");
+
+    let selectedFile = null;
+
+    dropZone.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", e => handleFile(e.target.files[0]));
+
+    dropZone.addEventListener("dragover", e => {
+      e.preventDefault();
+      dropZone.classList.add("drag-over");
+    });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+    dropZone.addEventListener("drop", e => {
+      e.preventDefault();
+      dropZone.classList.remove("drag-over");
+      handleFile(e.dataTransfer.files[0]);
+    });
+
+    function handleFile(file) {
+      if (!file || !file.type.startsWith("image/")) return;
+      selectedFile = file;
+      const reader = new FileReader();
+      reader.onload = e => {
+        preview.src = e.target.result;
+        preview.style.display = "block";
+      };
+      reader.readAsDataURL(file);
+      btn.disabled = false;
+      result.style.display = "none";
+      resultEmpty.style.display = "block";
+      errorMsg.textContent = "";
+    }
+
+    btn.addEventListener("click", async () => {
+      if (!selectedFile) return;
+      btn.disabled = true;
+      btn.textContent = "Classifying...";
+      errorMsg.textContent = "";
+
+      const form = new FormData();
+      form.append("file", selectedFile);
+
+      try {
+        const resp = await fetch("/predict", { method: "POST", body: form });
+        if (!resp.ok) {
+          const err = await resp.json();
+          throw new Error(err.detail || "Server error.");
+        }
+        const data = await resp.json();
+
+        topSpecies.textContent = data.species;
+        topConf.textContent    = "Confidence: " + (data.confidence * 100).toFixed(1) + "%";
+
+        top5List.innerHTML = "";
+        data.top5.forEach(item => {
+          const pct = (item.confidence * 100).toFixed(1);
+          const li  = document.createElement("li");
+          li.innerHTML = `
+            <span class="species-name">${item.species}</span>
+            <div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div>
+            <span class="conf-val">${pct}%</span>
+          `;
+          top5List.appendChild(li);
+        });
+
+        resultEmpty.style.display = "none";
+        result.style.display = "block";
+      } catch (e) {
+        errorMsg.textContent = "Error: " + e.message;
+      } finally {
+        btn.disabled    = false;
+        btn.textContent = "Classify";
+      }
+    });
+  </script>
+</body>
+</html>
