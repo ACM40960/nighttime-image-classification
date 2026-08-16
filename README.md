@@ -112,8 +112,8 @@ project-root/
 **1. Clone the repository:**
 
    ```bash
-   git clone https://github.com/<your-username>/<your-repo-name>.git
-   cd <your-repo-name>
+   git clone https://github.com/ACM40960/nighttime-image-classification.git
+   cd nighttime-image-classification
    ```
 
 **2. Create a virtual environment:**
