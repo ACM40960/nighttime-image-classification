@@ -1,7 +1,7 @@
 <div align="center">
   <h1>A Vision Transformer (ViT)-based Domain Adaptation Framework for Wildlife Camera-Trap Species Classification</h3>
 
-![Python](https://img.shields.io/badge/Python-v3.9%2B-blue)
+![Python](https://img.shields.io/badge/Python-v3.10%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-v2.2%2B-orange)
 ![Transformers](https://img.shields.io/badge/Transformers-Latest-blue)
 ![OpenCV](https://img.shields.io/badge/OpenCV-Latest-blue)
