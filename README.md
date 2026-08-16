@@ -1,5 +1,5 @@
 <div align="center">
-  <h2>A Vision Transformer (ViT)-Based Domain Adaptation Framework for Day-to-Night Species Identification</h3>
+  <h1>A Vision Transformer (ViT)-based Domain Adaptation Framework for Wildlife Camera-Trap Species Classification</h3>
 
 ![Python](https://img.shields.io/badge/Python-v3.9%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-v2.2%2B-orange)
