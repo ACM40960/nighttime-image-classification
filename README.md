@@ -8,6 +8,8 @@
 ![Matplotlib](https://img.shields.io/badge/Matplotlib-Latest-blue)
 ![Numpy](https://img.shields.io/badge/Numpy-Latest-blue)
 ![Backbone](https://img.shields.io/badge/Backbone-DINOv2--ViT--B%2F14-green)
+![FastAPI](https://img.shields.io/badge/FastAPI-Latest-teal)
+![Uvicorn](https://img.shields.io/badge/Uvicorn-Latest-teal)
 ![License](https://img.shields.io/badge/License-MIT-brightgreen)
 ![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 </div>
@@ -26,8 +28,8 @@ A day-to-night domain-adaptive species identification pipeline built on `faceboo
   - [Data Installation](#data-installation)
   - [Repository Installation](#repository-installation)
 - [Running the Pipeline](#running-the-pipeline)
-  - [Model training](#model-training)
-  - [Inference webapp](#inference-webapp)
+  - [Model Training](#model-training)
+  - [Inference Webapp](#inference-webapp)
 - [Methodology](#methodology)
   - [Dataset Structure](#dataset-structure)
   - [Architecture](#architecture)
@@ -36,7 +38,8 @@ A day-to-night domain-adaptive species identification pipeline built on `faceboo
 - [Results](#results)
   - [Evaluation Metrics](#evaluation-metrics)
   - [Output Files](#output-files)
-  - [Framework performance](#framework-performance)
+  - [Framework Performance](#framework-performance)
+  - [Inference Demo](#inference-demo)
 - [Limitations and Future Work](#limitations-and-future-work)
 - [Contributing](#contributing)
 - [License](#license)
@@ -141,7 +144,7 @@ project-root/
 
 ## Running the Pipeline
 
-### Model training
+### Model Training
 
 ```bash
 # Baseline (no adaptation)
@@ -180,7 +183,7 @@ python main.py \
 | `--use_data_adapt` | off | Append night-simulated copies of daytime images to training |
 | `--use_supcon` | off | Enable supervised contrastive learning schedule |
 
-### Inference webapp
+### Inference Webapp
 
 ```bash
 # Inference on best checkpoint stored in output
@@ -332,7 +335,7 @@ All output filenames include a datetime stamp `dd_mm_yy_hh_mm_ss` so successive 
 | `confusion_matrix_{ts}.csv` | Raw confusion fractions |
 | `pr_auc_{ts}.png` | Precision-recall curves (one per species + macro) |
 
-### Framework performance
+### Framework Performance
 
 **Model performance comparison**
 
@@ -350,12 +353,14 @@ Ablation results show consistent gains from each added component, with the **ful
   <img src="assets/conf_matrix.png"
        alt="Confidence matrix"
        style="max-width:100%; height:auto; display:block;">
+  <div style="margin-top:8px;"><sub>Confidence matrix</sub></div>
 </div>
 
 <div align="center" style="margin:0 0 28px;">
   <img src="assets/pr_auc.png"
        alt="PR-AUC curve"
        style="max-width:100%; height:auto; display:block;">
+  <div style="margin-top:8px;"><sub>PR-AUC curve</sub></div>
 </div>
 
 - The model achieves high per-class recall and ranking quality (macro PR-AUC = 0.9517) overall, with 10 of 17 species classified correctly ≥93% of the time and 13 of 17 classes exceeding 0.92 PR-AUC.
@@ -363,6 +368,17 @@ Ablation results show consistent gains from each added component, with the **ful
 - Severely imbalanced class is addressed but not fully resolved, as the weakest classes remain the ones with few daytime samples for training. Hare is the only exception with excellent classification capability despite the low number training images.
 
 More detailed evaluation results can be found at [Output](/outputs/).
+
+### Inference Demo
+
+<div align="center" style="margin:0 0 28px;">
+  <img src="assets/webapp.png"
+       alt="Inference"
+       style="max-width:100%; height:auto; display:block;">
+  <div style="margin-top:8px;"><sub>Webapp working example</sub></div>
+</div>
+
+The web application provides a prediction on a given night-vision animal image, including the top five candidates with their respective confidence scores.
 
 ## Limitations and Future Work
 
