@@ -238,7 +238,7 @@ The backbone uses `facebook/dinov2-base` (ViT-B/14) with 12 transformer blocks, 
   <div style="margin-top:8px;"><sub>Overall pipeline workflow</sub></div>
 </div>
 
-**Data Adaptation:** When `--use_data_adapt` is enabled, each daytime training image is also passed through a night-simulation pipeline (fixed medium strength) that applies:
+**Data Adaptation:** When `--use_data_adapt` is enabled, each daytime training image is also passed through a night-simulation pipeline that applies:
  
 1. CLAHE in LAB colour space (local contrast enhancement).
 2. Random greyscale conversion (near-IR desaturation, p=0.5).
@@ -367,7 +367,7 @@ Ablation results show consistent gains from each added component, with the **ful
 - Performance is weakest for the four species: Sable, RaccoonDog, MuskDeer, and LeopardCat. This is consistent with expected difficulty in separating nocturnal species of similar size or coated at night.
 - Severely imbalanced class is addressed but not fully resolved, as the weakest classes remain the ones with few daytime samples for training. Hare is the only exception with excellent classification capability despite the low number training images.
 
-More detailed evaluation results can be found at [Output](/outputs/).
+More detailed evaluation results can be found at [Output](/outputs/). You may also find a viisualisation of the framework and its results at [Poster](/assets/poster.pdf).
 
 ### Inference Demo
 
