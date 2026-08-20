@@ -404,7 +404,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 **Xuan Bach Nguyen**
 -  Email: [xuan.b.nguyen@ucdconnect.ie](mailto:xuan.b.nguyen@ucdconnect.ie) and [bachnx1710@gmail.com](mailto:bachnx1710@gmail.com)
 -  LinkedIn: [https://www.linkedin.com/in/xuan-bach-nguyen-178055368/](https://www.linkedin.com/in/xuan-bach-nguyen-178055368/)
--  Institution: University College Dublin, M.Sc. Data & Computational Science, 25206963
+-  Institution: University College Dublin, MSc. Data & Computational Science, 25206963
 
 ## References
 
